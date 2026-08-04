@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+
+# Runtime/generated
+*.log
+config.ini
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
