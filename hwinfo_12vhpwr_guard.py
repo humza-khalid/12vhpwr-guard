@@ -1317,14 +1317,26 @@ def run_tray(stop_event: threading.Event):
     )
 
     def updater():
+        # The icon image is re-pushed every ICON_RESYNC_TICKS even without a status
+        # change, not just on transitions. A one-shot update can be lost while
+        # Explorer is still building the taskbar at logon (the re-registered tray
+        # icon resurrects the startup image); the tooltip already self-heals because
+        # it is reassigned every tick, and the image must do the same.
+        ICON_RESYNC_TICKS = 10
+        images = {}
         last_status = None
+        ticks_since_push = 0
         while not stop_event.is_set():
             st = get_state()
             status = Status.PAUSED if st.get("paused") else st.get("status", Status.OK)
 
-            if status != last_status:
-                icon.icon = make_icon(status)
+            ticks_since_push += 1
+            if status != last_status or ticks_since_push >= ICON_RESYNC_TICKS:
+                if status not in images:
+                    images[status] = make_icon(status)
+                icon.icon = images[status]
                 last_status = status
+                ticks_since_push = 0
 
             icon.title = tray_title()
             time.sleep(1.0)
