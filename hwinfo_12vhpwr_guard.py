@@ -8,6 +8,7 @@ import threading
 import logging
 import configparser
 import queue
+import xml.etree.ElementTree as ET
 from logging.handlers import RotatingFileHandler
 from typing import List, Tuple, Optional
 
@@ -296,11 +297,12 @@ HWiNFOGoneError = SensorGoneError
 # Reversible GPU slowdown - optional import
 # =========================
 try:
-    from gpu_mitigation import GpuMitigator
+    from gpu_mitigation import GpuMitigator, is_process_elevated
     HAVE_MITIGATION = True
 except Exception:
     HAVE_MITIGATION = False
     GpuMitigator = None
+    is_process_elevated = None
 
 # =========================
 # Toast notifications (winotify)
@@ -1070,6 +1072,148 @@ class TieredResponse:
         self.released_at = None
 
 # =========================
+# Autostart (Task Scheduler)
+# =========================
+# This only flips the Enabled flag on the task the installer already created. It
+# deliberately does not create the task: the trigger, principal and restart
+# settings live in install.ps1, and a second copy here would drift out of sync
+# with it the first time either side changed.
+
+TASK_NAME = "12VHPWR Guard"
+TASK_SCHEMA_NS = "{http://schemas.microsoft.com/windows/2004/02/mit/task}"
+CREATE_NO_WINDOW = 0x08000000
+
+# pystray asks for the checkmark state every time the menu is drawn, and each ask
+# would otherwise cost a schtasks process launch.
+_AUTOSTART_CACHE_TTL_SEC = 2.0
+_autostart_cache = {"value": None, "at": 0.0}
+
+# Bounds only the failure case: the confirm loop returns as soon as the change is
+# visible, so a generous budget costs nothing on success and avoids reporting a
+# failure for a change that did apply, just slowly, on a loaded machine.
+_AUTOSTART_CONFIRM_TIMEOUT_SEC = 5.0
+_AUTOSTART_CONFIRM_POLL_SEC = 0.1
+
+
+def _is_elevated() -> bool:
+    """Defer to gpu_mitigation's check so "elevated" has one definition in the project.
+
+    Its token-based test is stricter than IsUserAnAdmin, and the mitigation path already
+    gates on it, so the autostart toggle agreeing with it matters. The fallback only runs
+    when that module failed to import, which is the same condition that already drops the
+    guard to shutdown-only.
+    """
+    if is_process_elevated is not None:
+        return is_process_elevated()
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _schtasks_path() -> str:
+    # Absolute, for the same reason shutdown.exe is: PATH is not to be trusted here.
+    return os.path.join(
+        os.environ.get("SystemRoot", r"C:\Windows"), "System32", "schtasks.exe"
+    )
+
+
+def _clean_task_xml(raw: bytes) -> str:
+    """Decode schtasks /xml output into something ElementTree will accept.
+
+    schtasks always writes the header encoding="UTF-16", but only actually emits
+    UTF-16 when stdout is a console; redirected to a pipe, as it is here, the
+    bytes are single-byte. Handing those to the parser fails with "encoding
+    specified in XML declaration is incorrect", so the declaration is dropped and
+    the text is passed as str. ElementTree rejects a str that still carries an
+    encoding declaration, which is why it has to go rather than be corrected.
+    Both forms are decoded anyway so this does not depend on that behaviour.
+    """
+    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
+        # The utf-16 codec consumes the BOM itself.
+        text = raw.decode("utf-16", errors="replace")
+    else:
+        # utf-8-sig strips a UTF-8 BOM when one is present, plain utf-8 otherwise.
+        text = raw.decode("utf-8-sig", errors="replace")
+    text = text.lstrip()
+    if text.startswith("<?xml") and "?>" in text:
+        text = text.split("?>", 1)[1]
+    return text
+
+
+def query_autostart() -> Optional[bool]:
+    """True/False if the logon task exists and is enabled/disabled, None if absent.
+
+    Reads /xml rather than /fo LIST because the XML element names come from the
+    Task Scheduler schema and are the same on every locale, while the LIST field
+    labels are translated and would not parse on a non-English Windows.
+    """
+    try:
+        proc = subprocess.run(
+            [_schtasks_path(), "/query", "/tn", TASK_NAME, "/xml", "ONE"],
+            capture_output=True, creationflags=CREATE_NO_WINDOW,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    try:
+        root = ET.fromstring(_clean_task_xml(proc.stdout))
+    except ET.ParseError:
+        return None
+    node = root.find(f"{TASK_SCHEMA_NS}Settings/{TASK_SCHEMA_NS}Enabled")
+    # A missing <Enabled> means the schema default, which is true.
+    if node is None or node.text is None:
+        return True
+    return node.text.strip().lower() == "true"
+
+
+def autostart_state(force: bool = False) -> Optional[bool]:
+    now = time.time()
+    if force or (now - _autostart_cache["at"]) > _AUTOSTART_CACHE_TTL_SEC:
+        _autostart_cache["value"] = query_autostart()
+        _autostart_cache["at"] = now
+    return _autostart_cache["value"]
+
+
+def set_autostart(enable: bool) -> bool:
+    """Enable/disable the logon task. True once the change is visible in the task."""
+    args = ["/change", "/tn", TASK_NAME, "/enable" if enable else "/disable"]
+    _autostart_cache["at"] = 0.0
+
+    if _is_elevated():
+        try:
+            proc = subprocess.run(
+                [_schtasks_path(), *args],
+                capture_output=True, creationflags=CREATE_NO_WINDOW,
+            )
+            return proc.returncode == 0
+        except Exception:
+            return False
+
+    # Started by hand rather than by the task, so the process is not elevated.
+    # One UAC prompt beats sending the user off to find install.bat.
+    params = " ".join(f'"{a}"' if " " in a else a for a in args)
+    try:
+        rc = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", _schtasks_path(), params, None, 0
+        )
+    except Exception:
+        return False
+    if rc <= 32:  # includes the user declining the UAC prompt
+        return False
+
+    # ShellExecuteW waits for the UAC decision but not for the process it starts,
+    # and never reports that process's exit code, so the only honest confirmation
+    # is reading the task back.
+    deadline = time.time() + _AUTOSTART_CONFIRM_TIMEOUT_SEC
+    while time.time() < deadline:
+        time.sleep(_AUTOSTART_CONFIRM_POLL_SEC)
+        if query_autostart() == enable:
+            return True
+    return False
+
+# =========================
 # Shared state for tray
 # =========================
 state_lock = threading.Lock()
@@ -1675,6 +1819,29 @@ class DialogService:
         done.wait()
         return result_holder["val"]
 
+    def show_error(self, title: str, msg: str) -> None:
+        """Show an error dialog, safe to call from any thread.
+
+        _show_error touches Tk directly and is only safe on the Tk thread, which
+        is why its existing caller runs inside a queued task. This marshals the
+        same way rather than reaching into it from the caller's thread.
+        """
+        if not HAVE_TKINTER:
+            return
+
+        done = threading.Event()
+
+        def task():
+            try:
+                self._show_error(title, msg)
+            except Exception:
+                pass
+            finally:
+                done.set()
+
+        self.req_q.put(task)
+        done.wait()
+
     def confirm(self, title: str, msg: str) -> bool:
         """Show a yes/no confirmation dialog. Returns True if yes, False if no."""
         if not HAVE_TKINTER:
@@ -1847,6 +2014,33 @@ def toggle_pause(_icon, _item):
     st = get_state()
     set_state(paused=not st.get("paused", False))
 
+def toggle_autostart(_icon, _item):
+    state = autostart_state(force=True)
+
+    if state is None:
+        if dialog is not None:
+            dialog.show_error(
+                "Autostart Not Installed",
+                "The logon task does not exist yet.\n\n"
+                "Run install.bat as administrator once to register it. "
+                "This switch then turns it on and off without reinstalling.",
+            )
+        return
+
+    target = not state
+    if set_autostart(target):
+        toast(
+            "12VHPWR Guard",
+            f"Start with Windows {'enabled' if target else 'disabled'}.",
+        )
+    elif dialog is not None:
+        dialog.show_error(
+            "Could Not Change Autostart",
+            "Updating the scheduled task failed.\n\n"
+            "Changing it needs administrator rights - approve the UAC prompt, "
+            "or run install.bat as administrator.",
+        )
+
 def on_exit(icon, _item, stop_event: threading.Event):
     set_state(last_message="Exiting...")
     stop_event.set()
@@ -1899,6 +2093,12 @@ def run_tray(stop_event: threading.Event):
                  checked=lambda _i: get_response_mode() == RESPONSE_TIERED),
             item("Response: Shutdown only", set_mode_shutdown_only, radio=True,
                  checked=lambda _i: get_response_mode() == RESPONSE_SHUTDOWN_ONLY),
+            pystray.Menu.SEPARATOR,
+            item(
+                "Start with Windows",
+                toggle_autostart,
+                checked=lambda _item: autostart_state() is True,
+            ),
             pystray.Menu.SEPARATOR,
             item("Reset to Defaults", reset_to_defaults),
         )),
