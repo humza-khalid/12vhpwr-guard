@@ -54,6 +54,7 @@ SUSTAINED_PROGRESS_LOG_EVERY_SEC = 5.0
 # Shutdown behavior
 SHUTDOWN_DELAY_SEC = 5
 SHUTDOWN_FORCE_CLOSE_APPS = True
+DRIVER_RESTART_COOLDOWN_SEC = 60.0
 
 # Hysteresis / clear
 CLEAR_HYSTERESIS_AMPS = 0.2
@@ -656,6 +657,22 @@ def shutdown_windows(logger: logging.Logger, reason: str) -> None:
         args.append("/f")
     subprocess.run(args, check=False)
 
+def restart_gpu_driver(logger: logging.Logger, reason: str) -> None:
+    logger.critical(f"DRIVER RESTART TRIGGERED: {reason}")
+    toast("12VHPWR Guard - Driver Restart", reason)
+    if HAVE_EVENTLOG:
+        eventlog_write(win32con.EVENTLOG_WARNING_TYPE, 5091, reason)
+
+    # Use PowerShell to disable and enable the display adapter
+    cmd = [
+        "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+        "Get-PnpDevice -Class Display | Disable-PnpDevice -Confirm:$false; Start-Sleep -Seconds 2; Get-PnpDevice -Class Display | Enable-PnpDevice -Confirm:$false"
+    ]
+    kwargs = {}
+    if os.name == 'nt':
+        kwargs['creationflags'] = 0x08000000
+    subprocess.run(cmd, check=False, **kwargs)
+
 # =========================
 # Shared state for tray
 # =========================
@@ -714,6 +731,7 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
     last_over_notice = 0.0
     pins_missing = False
     last_sample_time: Optional[float] = None
+    last_driver_restart = 0.0
 
     # active data source
     backend = None
@@ -912,14 +930,24 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
                     if consecutive_over >= CONSECUTIVE_SAMPLES_REQUIRED:
                         sustained = now - over_start
                         if sustained >= sustained_seconds_required:
-                            reason = (
-                                f"Sustained {sustained:.1f}s ≥ {sustained_seconds_required:.1f}s. "
-                                f"{max_label}={max_val:.2f}{max_unit} ≥ {threshold_amps:.2f}A"
-                            )
-                            set_state(status=Status.SHUTDOWN, last_message="Shutting down...")
-                            shutdown_windows(logger, reason)
-                            stop_event.set()
-                            break
+                            if now - last_driver_restart > DRIVER_RESTART_COOLDOWN_SEC:
+                                reason = (
+                                    f"Sustained {sustained:.1f}s ≥ {sustained_seconds_required:.1f}s. "
+                                    f"Restarting GPU driver to cut load."
+                                )
+                                restart_gpu_driver(logger, reason)
+                                last_driver_restart = now
+                                over_start = now
+                                last_over_notice = now
+                            else:
+                                reason = (
+                                    f"Sustained {sustained:.1f}s ≥ {sustained_seconds_required:.1f}s after driver restart. "
+                                    f"{max_label}={max_val:.2f}{max_unit} ≥ {threshold_amps:.2f}A"
+                                )
+                                set_state(status=Status.SHUTDOWN, last_message="Shutting down...")
+                                shutdown_windows(logger, reason)
+                                stop_event.set()
+                                break
 
                 elif cleared:
                     set_state(status=Status.OK, last_message=f"OK (max {max_val:.2f}{max_unit})")
