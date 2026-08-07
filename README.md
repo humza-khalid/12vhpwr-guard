@@ -42,6 +42,7 @@ This tool adds a last-line, OS-level safety net by:
 - **Silent background operation**
 - **Tray icon UI** with live status
 - **Configurable settings** via tray menu (threshold amps, sustained seconds)
+- **Autostart toggle** from the tray, without reinstalling
 - **Persistent configuration** saved to `config.ini`
 - Pause / Resume from tray
 - Toast notifications
@@ -402,9 +403,24 @@ Right-click the tray icon to access:
   - **Change Sustained Seconds Required...** - Adjust the sustained time requirement (default: 15.0 s)
   - **Response: Tiered / Response: Shutdown only** - Pick what an over-current does, see
     [How it responds](#how-it-responds). Takes effect immediately, no restart
+  - **Start with Windows** - Checkbox mirroring whether the logon task is enabled; click to turn autostart on or off
   - **Reset to Defaults** - Reset the threshold and sustained time to default values
 - **Pause / Resume** - Temporarily pause monitoring (releases the GPU if it is limited)
 - **Exit** - Stop the guard
+
+### Start with Windows
+
+The checkbox reflects the real state of the **"12VHPWR Guard"** scheduled task, so it stays
+accurate even if the task is changed from Task Scheduler directly.
+
+It enables and disables the existing task rather than creating one, so `install.bat` still has
+to be run once first; until then the item is unchecked and clicking it explains why. Keeping
+task creation in the installer means the trigger, principal and restart settings are defined in
+exactly one place.
+
+Changing a scheduled task needs administrator rights. Started from the task itself the guard is
+already elevated and the toggle applies immediately; started by hand it raises a single UAC
+prompt, and declining leaves the setting untouched.
 
 ---
 
