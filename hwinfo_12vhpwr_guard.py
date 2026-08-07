@@ -663,15 +663,29 @@ def restart_gpu_driver(logger: logging.Logger, reason: str) -> None:
     if HAVE_EVENTLOG:
         eventlog_write(win32con.EVENTLOG_WARNING_TYPE, 5091, reason)
 
-    # Use PowerShell to disable and enable the display adapter
+    # Use PowerShell to disable and enable the display adapter (use absolute path to avoid PATH hijack).
+    system_root = os.environ.get("SystemRoot", r"C:\\Windows")
+    powershell_exe = os.path.join(system_root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
     cmd = [
-        "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
-        "Get-PnpDevice -Class Display | Disable-PnpDevice -Confirm:$false; Start-Sleep -Seconds 2; Get-PnpDevice -Class Display | Enable-PnpDevice -Confirm:$false"
+        powershell_exe, "-NoProfile", "-NonInteractive", "-Command",
+        "Get-PnpDevice -Class Display | Disable-PnpDevice -Confirm:$false; Start-Sleep -Seconds 2; Get-PnpDevice -Class Display | Enable-PnpDevice -Confirm:$false",
     ]
     kwargs = {}
-    if os.name == 'nt':
-        kwargs['creationflags'] = 0x08000000
-    subprocess.run(cmd, check=False, **kwargs)
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+    try:
+        proc = subprocess.run(cmd, check=False, timeout=30, capture_output=True, text=True, **kwargs)
+    except Exception as ex:
+        logger.exception(f"GPU driver restart failed: {ex}")
+        shutdown_windows(logger, f"{reason} (GPU driver restart failed)")
+        return
+
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        logger.error(f"GPU driver restart PowerShell exited {proc.returncode}: {detail}")
+        shutdown_windows(logger, f"{reason} (GPU driver restart failed; exit {proc.returncode})")
+        return
 
 # =========================
 # Shared state for tray
