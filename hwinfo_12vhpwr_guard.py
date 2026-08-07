@@ -668,7 +668,7 @@ def restart_gpu_driver(logger: logging.Logger, reason: str) -> None:
     powershell_exe = os.path.join(system_root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
     cmd = [
         powershell_exe, "-NoProfile", "-NonInteractive", "-Command",
-        "Get-PnpDevice -Class Display | Disable-PnpDevice -Confirm:$false; Start-Sleep -Seconds 2; Get-PnpDevice -Class Display | Enable-PnpDevice -Confirm:$false",
+        "$ErrorActionPreference='Stop'; try { Get-PnpDevice -Class Display | Disable-PnpDevice -Confirm:$false -ErrorAction Stop; Start-Sleep -Seconds 2; Get-PnpDevice -Class Display | Enable-PnpDevice -Confirm:$false -ErrorAction Stop } catch { Write-Error $_; exit 1 }",
     ]
     kwargs = {}
     if os.name == "nt":
