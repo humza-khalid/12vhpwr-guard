@@ -61,6 +61,8 @@ ASTRAL_SUBSYSTEM_IDS = {
     0x89EC1043: "ROG Astral RTX 5090 LC",
     0x89E31043: "ROG Astral RTX 5090 OC",
     0x89DE1043: "ROG Astral RTX 5080 OC",
+    # Field-verified in issue #3 (working sensor reads) + OpenRGB device registry.
+    0x8A2E1043: "ROG Astral RTX 5090 OC White",
 }
 
 # Labels must match the HWiNFO backend exactly so downstream code is source-agnostic.

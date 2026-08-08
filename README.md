@@ -67,6 +67,11 @@ chip that measures each 12VHPWR pin individually. Recognized models (by PCI subs
 | `1043:8A61` | ROG Astral RTX 5090 Matrix |
 | `1043:89EC` | ROG Astral RTX 5090 LC |
 | `1043:89DE` | ROG Astral RTX 5080 OC |
+| `1043:8A2E` | ROG Astral RTX 5090 OC White |
+
+Have an Astral variant that is not in this table (the guard sits purple)? Run
+`nvidia-smi --query-gpu=name,pci.sub_device_id --format=csv` and open an issue with the
+output; adding a verified id is a one line change.
 
 No other GPU exposes per-pin current, including non-Astral RTX 5080/5090 cards. On unsupported
 hardware the guard cannot protect anything and will say so rather than pretend to work.

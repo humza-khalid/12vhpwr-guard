@@ -121,7 +121,7 @@ CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
 
 # Shown in the tray menu and logged at startup so "which version are you running"
 # is answerable without digging through files.
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 
 # Event Viewer source name
 EVENT_SOURCE = "12VHPWR Guard"

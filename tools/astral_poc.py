@@ -56,13 +56,14 @@ I2C_PORT_ID = 0x1                   # verified: 1, NOT 4
 I2C_SPEED_DEPRECATED = 0xFFFF
 I2C_SPEED_100KHZ = 4
 
-# subsystem id -> marketing name (LibreHardwareMonitor's exact list)
+# subsystem id -> marketing name (LibreHardwareMonitor's list + field-verified additions)
 ASTRAL_SUBSYSTEM_IDS = {
     0x89EA1043: "ROG Astral RTX 5090D OC",
     0x8A611043: "ROG Astral RTX 5090 Matrix",
     0x89EC1043: "ROG Astral RTX 5090 LC",
     0x89E31043: "ROG Astral RTX 5090 OC",
     0x89DE1043: "ROG Astral RTX 5080 OC",
+    0x8A2E1043: "ROG Astral RTX 5090 OC White",
 }
 
 # Sanity bounds. A garbage read (0xFFFF -> 65.535) must never look like a real measurement.
