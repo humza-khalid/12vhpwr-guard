@@ -68,6 +68,7 @@ chip that measures each 12VHPWR pin individually. Recognized models (by PCI subs
 | `1043:89EC` | ROG Astral RTX 5090 LC |
 | `1043:89DE` | ROG Astral RTX 5080 OC |
 | `1043:8A2E` | ROG Astral RTX 5090 OC White |
+| `1043:8A2B` | ROG Astral RTX 5080 OC White |
 
 Have an Astral variant that is not in this table (the guard sits purple)? Run
 `nvidia-smi --query-gpu=name,pci.sub_device_id --format=csv` and open an issue with the
