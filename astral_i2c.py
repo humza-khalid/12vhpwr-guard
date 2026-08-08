@@ -158,6 +158,7 @@ class AstralPinSensor:
         self._consecutive_failures = 0
         self.gpu_name = None
         self.model = None
+        self.subsystem_id: Optional[int] = None
         self.last_voltages: List[float] = []
 
     # -- NVAPI plumbing -----------------------------------------------------
@@ -221,6 +222,9 @@ class AstralPinSensor:
                 buf = ctypes.create_string_buffer(NVAPI_SHORT_STRING_MAX)
                 name = (buf.value.decode("utf-8", errors="replace")
                         if self._funcs["name"](handle, buf) == NVAPI_OK else "NVIDIA GPU")
+                # Kept so the mitigation side can bind NVML to this same physical card:
+                # NVML reports the subsystem id in the identical DWORD format.
+                self.subsystem_id = subsys.value
                 return handle, name, model
         return None, None, None
 

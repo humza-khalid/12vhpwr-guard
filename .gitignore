@@ -8,6 +8,7 @@ venv/
 *.log
 config.ini
 logs/
+mitigation.active
 
 # IDE
 .vscode/

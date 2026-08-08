@@ -46,6 +46,7 @@ if (!(Test-Path $ConfigPath)) {
 threshold_amps = 9.5
 sustained_seconds_required = 15
 sensor_backend = auto
+response_mode = tiered
 "@ | Set-Content -Path $ConfigPath -Encoding UTF8
 }
 
@@ -63,6 +64,15 @@ try {
         New-EventLog -LogName Application -Source $EventSource
     }
 } catch {}
+
+# Upgrades: a still-running guard would keep the OLD code alive and hold the
+# single-instance mutex against the new one, so the upgrade would not take effect
+# until the next reboot. Stop it first; on a fresh install this is a no-op.
+$Existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+if ($Existing) {
+    Write-Info "Existing install found - stopping the running guard to upgrade it."
+    try { Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue } catch {}
+}
 
 try {
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
