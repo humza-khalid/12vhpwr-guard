@@ -71,6 +71,13 @@ chip that measures each 12VHPWR pin individually. Recognized models (by PCI subs
 | `1043:8A2E` | ROG Astral RTX 5090 OC White |
 | `1043:8A2B` | ROG Astral RTX 5080 OC White |
 | `1043:8A45` | ROG Astral RTX 5080 OC Hatsune Miku |
+| `1043:8A5A` | ROG Astral RTX 5090 BTF OC (see BTF note) |
+
+**BTF note:** the BTF card is supported when it draws power through the normal 16-pin cable
+in a standard motherboard, which is where its card-side sensors sit. Installed in an actual
+BTF motherboard (power through the GC-HPWR slot connector), the load bypasses those sensors:
+the guard would read near zero on every pin and could not protect anything. Do not rely on
+this tool for a GC-HPWR powered card.
 
 Have an Astral variant that is not in this table (the guard sits purple)? Run
 `nvidia-smi --query-gpu=name,pci.sub_device_id --format=csv` and open an issue with the

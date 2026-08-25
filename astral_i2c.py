@@ -67,6 +67,10 @@ ASTRAL_SUBSYSTEM_IDS = {
     0x8A2B1043: "ROG Astral RTX 5080 OC White",
     # Id straight from the owner's nvidia-smi (issue #4); official Astral-family SKU.
     0x8A451043: "ROG Astral RTX 5080 OC Hatsune Miku",
+    # Field-verified via Reddit (2026-08-21): nvidia-smi id + HWiNFO showing live card-side
+    # per-pin data with the card in a STANDARD board on the 16-pin cable. In a BTF board
+    # (GC-HPWR slot power) the card-side sensors do not carry the load - see README.
+    0x8A5A1043: "ROG Astral RTX 5090 BTF OC",
 }
 
 # Labels must match the HWiNFO backend exactly so downstream code is source-agnostic.

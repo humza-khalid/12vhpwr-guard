@@ -66,6 +66,7 @@ ASTRAL_SUBSYSTEM_IDS = {
     0x8A2E1043: "ROG Astral RTX 5090 OC White",
     0x8A2B1043: "ROG Astral RTX 5080 OC White",
     0x8A451043: "ROG Astral RTX 5080 OC Hatsune Miku",
+    0x8A5A1043: "ROG Astral RTX 5090 BTF OC",
 }
 
 # Sanity bounds. A garbage read (0xFFFF -> 65.535) must never look like a real measurement.
