@@ -72,6 +72,7 @@ chip that measures each 12VHPWR pin individually. Recognized models (by PCI subs
 | `1043:8A2B` | ROG Astral RTX 5080 OC White |
 | `1043:8A45` | ROG Astral RTX 5080 OC Hatsune Miku |
 | `1043:8A5A` | ROG Astral RTX 5090 BTF OC (see BTF note) |
+| `1043:8A3C` | ROG Astral RTX 5090 BTF OC, second id revision of the same card (see BTF note) |
 
 **BTF note:** the BTF card is supported when it draws power through the normal 16-pin cable
 in a standard motherboard, which is where its card-side sensors sit. Installed in an actual

@@ -71,6 +71,10 @@ ASTRAL_SUBSYSTEM_IDS = {
     # per-pin data with the card in a STANDARD board on the 16-pin cable. In a BTF board
     # (GC-HPWR slot power) the card-side sensors do not carry the load - see README.
     0x8A5A1043: "ROG Astral RTX 5090 BTF OC",
+    # Same card, second subsystem id revision: owner's nvidia-smi in issue #5 plus the
+    # OpenRGB registry, which lists 0x8A3C and 0x8A5A side by side for this exact SKU.
+    # The BTF board caveat above applies to this id as well.
+    0x8A3C1043: "ROG Astral RTX 5090 BTF OC",
 }
 
 # Labels must match the HWiNFO backend exactly so downstream code is source-agnostic.
