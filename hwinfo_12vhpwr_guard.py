@@ -1,5 +1,7 @@
 import ctypes
 import ctypes.wintypes as wt
+import glob
+import json
 import os
 import sys
 import time
@@ -9,6 +11,7 @@ import logging
 import configparser
 import queue
 import xml.etree.ElementTree as ET
+from collections import deque
 from logging.handlers import RotatingFileHandler
 from typing import List, Tuple, Optional
 
@@ -120,9 +123,25 @@ LOG_BACKUP_COUNT = 5
 # Config file
 CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
 
+# Written when the guard fires an emergency shutdown, shown and removed at the next
+# start. Without it, a shutdown that happens while the user is away is a mystery:
+# the machine is just off, Windows gets the blame, and the bad cable gets plugged
+# straight back into a heavy load.
+LAST_SHUTDOWN_PATH = os.path.join(BASE_DIR, "last_shutdown.json")
+
+# Flight recorder: the last ~minute of per-pin samples, kept in memory only and
+# written to logs/ when the guard acts. The dump is the evidence for a bug report
+# or an RMA claim; normal operation never touches the disk for it.
+FLIGHT_SAMPLES = 120  # 60 s at the 0.5 s poll interval
+FLIGHT_KEEP_FILES = 10
+
+# A paused guard protects nothing. Remind at a cadence that is noticeable without
+# being punishment; 0 disables.
+PAUSE_REMINDER_EVERY_SEC = 1800.0
+
 # Shown in the tray menu and logged at startup so "which version are you running"
 # is answerable without digging through files.
-APP_VERSION = "1.2.3"
+APP_VERSION = "1.3.0"
 
 # Event Viewer source name
 EVENT_SOURCE = "12VHPWR Guard"
@@ -774,6 +793,51 @@ class CrossCheck:
             self._handles = None
 
 
+class FlightRecorder:
+    """The last ~minute of per-pin samples, written to disk only when the guard acts.
+
+    Memory only in normal operation, so the lightweight promise holds. The dump is
+    what a bug report or an RMA claim needs: what every pin was doing in the sixty
+    seconds before the guard limited the GPU or shut the machine down.
+    """
+
+    def __init__(self, maxlen: int = FLIGHT_SAMPLES):
+        self._buf = deque(maxlen=maxlen)
+
+    def record(self, pins) -> None:
+        self._buf.append((time.time(), [round(a, 3) for _label, a, _unit in pins]))
+
+    def dump(self, logger: logging.Logger, event: str) -> Optional[str]:
+        """Write the buffer to logs/flight_<stamp>_<event>.csv. Returns the path."""
+        if not self._buf:
+            return None
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(LOG_DIR, f"flight_{stamp}_{event}.csv")
+        try:
+            first_len = len(self._buf[0][1])
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write("time," + ",".join(f"pin{i + 1}" for i in range(first_len)) + "\n")
+                for ts, vals in self._buf:
+                    iso = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+                    f.write(f"{iso}.{int(ts % 1 * 1000):03d},"
+                            + ",".join(f"{v:.3f}" for v in vals) + "\n")
+            logger.info(f"Flight recorder: {len(self._buf)} samples written to {path}")
+        except Exception as ex:
+            logger.warning(f"Flight recorder: could not write dump ({ex})")
+            return None
+        self._prune()
+        return path
+
+    def _prune(self) -> None:
+        """Keep the newest FLIGHT_KEEP_FILES dumps; the stamp sorts chronologically."""
+        try:
+            flights = sorted(glob.glob(os.path.join(LOG_DIR, "flight_*.csv")))
+            for old in flights[:-FLIGHT_KEEP_FILES]:
+                os.remove(old)
+        except Exception:
+            pass
+
+
 def candidate_backends(logger: logging.Logger) -> List[object]:
     """Backend classes to try, in order, for the configured sensor_backend setting."""
     if SENSOR_BACKEND == "hwinfo":
@@ -806,8 +870,64 @@ def setup_logger() -> logging.Logger:
 
     return logger
 
+def note_shutdown_reason(reason: str) -> None:
+    """Leave a note for the next start saying why this machine went down.
+
+    Best-effort: the log and Event Viewer carry the reason regardless, this file
+    exists so the next start can put it in the user's face.
+    """
+    payload = {
+        "time": time.time(),
+        "time_human": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "reason": reason,
+        "version": APP_VERSION,
+    }
+    tmp = LAST_SHUTDOWN_PATH + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, LAST_SHUTDOWN_PATH)
+    except Exception:
+        pass
+
+def announce_last_shutdown(logger: logging.Logger) -> None:
+    """One-shot at startup: if the guard ended the last session, say so loudly.
+
+    A corrupt note still announces (generic wording), because a corrupt note still
+    means the guard shut this machine down. The file is removed either way.
+    """
+    if not os.path.exists(LAST_SHUTDOWN_PATH):
+        return
+    try:
+        try:
+            with open(LAST_SHUTDOWN_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                data = {}
+        except Exception:
+            data = {}
+        when = data.get("time_human", "an earlier session")
+        reason = data.get("reason", "sustained overcurrent on a 12VHPWR pin")
+        msg = (f"The last shutdown was an emergency stop by 12VHPWR Guard ({when}): "
+               f"{reason} Check the connector and cable seating before the next "
+               f"heavy load.")
+        logger.warning(msg)
+        if HAVE_EVENTLOG:
+            eventlog_write(win32con.EVENTLOG_WARNING_TYPE, 5091, msg)
+        toast("12VHPWR Guard - read this", msg)
+    finally:
+        for path in (LAST_SHUTDOWN_PATH + ".tmp", LAST_SHUTDOWN_PATH):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+
 def shutdown_windows(logger: logging.Logger, reason: str) -> None:
     logger.critical(f"SHUTDOWN TRIGGERED: {reason}")
+    note_shutdown_reason(reason)
     toast("12VHPWR Guard - Shutdown", reason)
     if HAVE_EVENTLOG:
         eventlog_write(win32con.EVENTLOG_ERROR_TYPE, 5090, reason)
@@ -1267,6 +1387,7 @@ def run_startup_recovery(logger: logging.Logger) -> None:
 def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
     eventlog_register_source(logger)
     run_startup_recovery(logger)
+    announce_last_shutdown(logger)
 
     threshold_amps, sustained_seconds_required = get_config_values()
     tier_values = get_tier_values()
@@ -1308,7 +1429,13 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
     # active data source
     backend = None
     crosscheck = CrossCheck()
+    flight = FlightRecorder()
     backend_classes = candidate_backends(logger)
+
+    # pause bookkeeping: a paused guard protects nothing, so it must not be
+    # possible to pause it and forget it.
+    paused_since: Optional[float] = None
+    last_pause_reminder = 0.0
 
     # tiered response
     mitigator = None
@@ -1431,13 +1558,30 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
             if st.get("paused"):
                 # Checked before connecting so a paused guard stays quiet rather than
                 # toasting about HWiNFO being absent.
+                now_paused = time.time()
+                if paused_since is None:
+                    paused_since = now_paused
+                    last_pause_reminder = now_paused
                 if response.engaged:
                     # Pausing hands the decision back to the user. Leaving their GPU
                     # crippled while no longer watching it is not ours to do.
-                    response.release(time.time(), "monitoring paused", arm_retrigger=False)
+                    response.release(now_paused, "monitoring paused", arm_retrigger=False)
+                if (PAUSE_REMINDER_EVERY_SEC
+                        and (now_paused - last_pause_reminder) >= PAUSE_REMINDER_EVERY_SEC):
+                    minutes = int((now_paused - paused_since) / 60)
+                    msg = (f"Monitoring has been paused for {minutes} minutes - the card "
+                           f"is unprotected until you resume from the tray.")
+                    logger.warning(msg)
+                    toast("12VHPWR Guard - still paused", msg)
+                    last_pause_reminder = now_paused
                 set_state(status=Status.PAUSED, last_message="Paused")
                 time.sleep(0.5)
                 continue
+
+            if paused_since is not None:
+                minutes = int((time.time() - paused_since) / 60)
+                logger.info(f"Monitoring resumed after {minutes} min paused.")
+                paused_since = None
 
             # (Re)connect whenever we have no live data source.
             if backend is None:
@@ -1498,6 +1642,7 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
                         toast("12VHPWR Guard", msg)
 
                 crosscheck.maybe_log(logger, backend, pins)
+                flight.record(pins)
 
                 max_label, max_val, max_unit = max(pins, key=lambda x: x[1])
                 set_state(max_label=max_label, max_val=max_val, max_unit=max_unit)
@@ -1582,6 +1727,7 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
                 # The response ladder decides what a tier crossing costs: a GPU
                 # slowdown, or the machine. It runs every tick, including while a
                 # mitigation is already engaged.
+                was_engaged = response.engaged
                 shutdown_reason = response.evaluate(
                     now=now,
                     max_val=max_val,
@@ -1597,10 +1743,17 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
                         status=Status.MITIGATED,
                         last_message=f"GPU limited: {max_label} {max_val:.2f}{max_unit}",
                     )
+                    if not was_engaged and not shutdown_reason:
+                        # The minute leading up to the engagement is the evidence.
+                        # When engage and shutdown land in the same tick (tier 3,
+                        # persistent-fault re-trigger), the shutdown dump below is
+                        # the same data under the more accurate name.
+                        flight.dump(logger, "engaged")
 
                 if shutdown_reason:
                     set_state(status=Status.SHUTDOWN, last_message="Shutting down...")
                     shutting_down = True
+                    flight.dump(logger, "shutdown")
                     shutdown_windows(logger, shutdown_reason)
                     stop_event.set()
                     break
@@ -1667,10 +1820,13 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
                 pass
 
         if mitigator is not None:
-            if shutting_down:
+            if shutting_down and response.engaged:
                 # The machine is powering off in seconds and the card should stay
                 # limited until it does. The marker file left behind is what makes the
                 # next start put everything back, if the reboot itself does not.
+                # Gated on engaged: a tiered-but-unavailable session that shuts down
+                # never engaged anything, and must not log a claim about a marker
+                # file that was never written.
                 logger.info("Leaving the GPU limited through shutdown; the marker file "
                             "will trigger a restore on the next start.")
             else:

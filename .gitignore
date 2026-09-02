@@ -9,6 +9,7 @@ venv/
 config.ini
 logs/
 mitigation.active
+last_shutdown.json
 
 # IDE
 .vscode/

@@ -38,6 +38,10 @@ This tool adds a last-line, OS-level safety net by:
 - **Severity tiers**: the higher the current, the faster the response (15 s / 3 s / immediate)
 - **Fully reversible**: your exact power limit is restored and the clocks unlocked once the
   fault clears, including after a crash
+- **Tells you why**: after an emergency shutdown, the next start shows what happened and
+  when, so a trip while you were away is not a mystery
+- **Flight recorder**: the last minute of per-pin samples is saved to `logs/` whenever the
+  guard acts, evidence for a bug report or an RMA claim
 - **Force-closes blocking apps** during shutdown so nothing can stall it (on by default; `SHUTDOWN_FORCE_CLOSE_APPS` in the source)
 - **Silent background operation**
 - **Tray icon UI** with live status
@@ -203,6 +207,20 @@ minimum the card reports and the clock target is its lowest supported frequency,
 from the card at startup. There is no useful way to tune an emergency response except weaker,
 and the session survives floor clocks for two minutes either way. What you *can* configure is
 when it happens, never how hard.
+
+### After it fires
+
+An emergency shutdown leaves a note. At the next start the guard announces exactly what
+happened and when, as a notification, a log warning and an Event Viewer entry, then removes
+the note. Without this, a shutdown that fires while you are away looks like a Windows crash,
+and the bad cable gets plugged straight back into a heavy load. If you see that message,
+check the connector seating before the next long session.
+
+Whenever the guard limits the GPU or shuts down, it also writes the last minute of per-pin
+samples to a `flight_*.csv` in the `logs` folder (the ten most recent are kept, and nothing
+is written to disk in normal operation). That file shows what every pin was doing in the
+sixty seconds before the guard acted, which is exactly what a bug report or an RMA claim
+needs.
 
 ### Response mode
 
@@ -414,7 +432,8 @@ Right-click the tray icon to access:
     [How it responds](#how-it-responds). Takes effect immediately, no restart
   - **Start with Windows** - Checkbox mirroring whether the logon task is enabled; click to turn autostart on or off
   - **Reset to Defaults** - Reset the threshold and sustained time to default values
-- **Pause / Resume** - Temporarily pause monitoring (releases the GPU if it is limited)
+- **Pause / Resume** - Temporarily pause monitoring (releases the GPU if it is limited).
+  While paused, a reminder fires every 30 minutes; a paused guard protects nothing
 - **Exit** - Stop the guard
 
 ### Start with Windows
