@@ -141,7 +141,7 @@ PAUSE_REMINDER_EVERY_SEC = 1800.0
 
 # Shown in the tray menu and logged at startup so "which version are you running"
 # is answerable without digging through files.
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 
 # Event Viewer source name
 EVENT_SOURCE = "12VHPWR Guard"
