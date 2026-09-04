@@ -168,6 +168,25 @@ SENSOR_BACKEND = DEFAULT_SENSOR_BACKEND
 # measurement. Sustained timers are reset rather than trusted across it.
 RESUME_GRACE_SEC = 5.0
 
+# =========================
+# Self-restart after sensor loss (v1.4)
+#
+# A driver update takes the NVAPI session the direct backend holds with it, and
+# nothing inside this process ever gets it back: the PR #1 experiment logged 131
+# reconnect attempts in a row, all of them failed, and the guard sat blind until
+# someone restarted the task by hand. A fresh process gets a fresh driver session,
+# so after this long with no source at all the guard exits with a non-zero code and
+# lets Task Scheduler (RestartCount 999, one minute apart) start it again. Set 0 to
+# turn the whole thing off and keep waiting instead.
+# =========================
+DEFAULT_SENSOR_LOSS_RESTART_SECONDS = 300.0
+SENSOR_LOSS_RESTART_SEC = DEFAULT_SENSOR_LOSS_RESTART_SECONDS
+
+# How long the loop waits between reconnect attempts once it has no source. Named
+# rather than left inline because it is also the cadence at which the restart clock
+# above gets looked at.
+RECONNECT_RETRY_SEC = 3.0
+
 # These will be loaded from config file or use defaults
 THRESHOLD_AMPS = DEFAULT_THRESHOLD_AMPS
 POLL_INTERVAL_SEC = 0.5
@@ -261,6 +280,7 @@ def load_config() -> dict:
         "sustained_seconds_required": DEFAULT_SUSTAINED_SECONDS_REQUIRED,
         "sensor_backend": DEFAULT_SENSOR_BACKEND,
         "response_mode": DEFAULT_RESPONSE_MODE,
+        "sensor_loss_restart_seconds": DEFAULT_SENSOR_LOSS_RESTART_SECONDS,
     }
     defaults.update(DEFAULT_TIER_VALUES)
     defaults.update(DEFAULT_ADVISORY_VALUES)
@@ -307,6 +327,17 @@ def load_config() -> dict:
             loaded[key] = value if value > 0 else fallback
         loaded["advisories_enabled"] = _config_bool(
             config, ADVISORIES_CONFIG_KEY, DEFAULT_ADVISORIES_ENABLED
+        )
+
+        # Read on its own because 0 is a real value here (the feature switched off),
+        # so the "positive or fall back" rule the loops above use would silently
+        # turn it back on. Only a negative number is nonsense.
+        restart_after = config.getfloat(
+            "Settings", "sensor_loss_restart_seconds",
+            fallback=DEFAULT_SENSOR_LOSS_RESTART_SECONDS,
+        )
+        loaded["sensor_loss_restart_seconds"] = (
+            restart_after if restart_after >= 0 else DEFAULT_SENSOR_LOSS_RESTART_SECONDS
         )
         return loaded
     except Exception:
@@ -416,6 +447,9 @@ set_tier_values(**_config_data)
 set_advisory_values(**_config_data)
 set_response_mode(_config_data.get("response_mode", DEFAULT_RESPONSE_MODE))
 SENSOR_BACKEND = _config_data.get("sensor_backend", DEFAULT_SENSOR_BACKEND)
+SENSOR_LOSS_RESTART_SEC = _config_data.get(
+    "sensor_loss_restart_seconds", DEFAULT_SENSOR_LOSS_RESTART_SECONDS
+)
 
 # =========================
 # Direct (HWiNFO-free) backend - optional import
@@ -1752,6 +1786,10 @@ shared = {
     # purple already means "cannot protect", and a guard that cannot see the load has
     # no business showing green. Cleared when the pins carry current again.
     "sensor_path_fault": False,
+    # What the process should exit with. 0 is a clean stop (the user chose Exit, or
+    # the machine is shutting down) and Task Scheduler leaves it alone; 1 asks the
+    # scheduler for a restart. Set through request_exit() only.
+    "exit_code": 0,
 }
 
 def set_state(**kwargs):
@@ -1761,6 +1799,49 @@ def set_state(**kwargs):
 def get_state():
     with state_lock:
         return dict(shared)
+
+# =========================
+# Ending the process
+# =========================
+# The tray icon, published by run_tray() so a background thread that has to end the
+# process can unblock icon.run() in the main thread. None before the tray starts and
+# under tests, so every use has to tolerate that.
+TRAY_ICON = None
+
+def request_exit(code: int, stop_event: Optional[threading.Event] = None) -> None:
+    """Ask the process to end with this code, from any thread.
+
+    The monitor runs in a daemon thread and cannot call sys.exit() itself: that would
+    end the thread and leave the tray running with nothing behind it. So the code goes
+    into shared state, the loop is told to stop, and the tray icon is stopped, which
+    returns main() from icon.run() and lets it exit with the code. A non-zero code is
+    the whole point of the self-restart: Task Scheduler only restarts a task whose
+    process failed.
+    """
+    set_state(exit_code=int(code))
+    if stop_event is not None:
+        stop_event.set()
+    icon = TRAY_ICON
+    if icon is not None:
+        try:
+            icon.stop()
+        except Exception:
+            pass
+
+def pending_exit_code() -> int:
+    """The code main() should exit with. 0 unless something asked for another one."""
+    try:
+        return int(get_state().get("exit_code", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+def _span_text(seconds: float) -> str:
+    """A window in seconds as something a toast can say out loud."""
+    if seconds >= 120:
+        return f"{seconds / 60:.0f} minutes"
+    if seconds >= 60:
+        return "1 minute"
+    return f"{seconds:g} seconds"
 
 # =========================
 # Monitor thread
@@ -1825,6 +1906,13 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
         logger.info("Sensor-path check: pins and board power")
     else:
         logger.info("Sensor-path check: pins only (no NVML in shutdown-only mode)")
+    # Read once here like the tier and advisory numbers, so a value the file changes
+    # mid-run cannot move the deadline a live outage is already being measured against.
+    restart_after = SENSOR_LOSS_RESTART_SEC
+    logger.info(
+        "Self-restart after direct sensor loss: "
+        + (f"{restart_after:g} s" if restart_after > 0 else "off")
+    )
     toast("12VHPWR Guard", "Monitoring started.")
     if HAVE_EVENTLOG:
         eventlog_write(win32con.EVENTLOG_INFORMATION_TYPE, 1000, "12VHPWR Guard started.")
@@ -1851,6 +1939,12 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
 
     # active data source
     backend = None
+    # Self-restart bookkeeping. direct_seen stays True for the rest of the process
+    # once the card's own sensor has been read: it is what separates "the driver took
+    # our session away" from "this machine never had a direct sensor to lose".
+    # source_lost_at is the moment the guard went blind, None whenever it is not.
+    direct_seen = False
+    source_lost_at: Optional[float] = None
     crosscheck = CrossCheck()
     flight = FlightRecorder()
     advisor = PinAdvisor(advisory_values)
@@ -2047,6 +2141,39 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
 
         return False
 
+    def maybe_restart_for_sensor_loss() -> bool:
+        """End the process when the direct sensor path has been gone too long.
+
+        A driver update kills the NVAPI session the direct backend holds and nothing
+        in this process ever gets it back (PR #1: 131 failed reconnects in a row, and
+        a blind guard until the task was restarted by hand). A new process gets a new
+        driver session, so past the window this exits non-zero and hands the problem
+        to Task Scheduler, which is the only thing here that can start the guard again.
+
+        Only for a session where the direct backend actually connected at some point.
+        An unsupported card, or a `sensor_backend = hwinfo` install, keeps waiting
+        purple exactly as before, so closing HWiNFO can never turn into a restart
+        loop. A session that ran on the direct sensor, fell back to HWiNFO and then
+        lost that too does restart: it has no source at all, and the direct path is
+        the one a fresh process can fix.
+
+        At most one restart per outage by construction, because the process ends.
+        """
+        if restart_after <= 0 or not direct_seen or source_lost_at is None:
+            return False
+        if (time.time() - source_lost_at) < restart_after:
+            return False
+
+        msg = (f"Restarting to recover the sensor path: no pin-current source for "
+               f"{restart_after:g} s after the direct sensor was lost")
+        logger.error(msg)
+        if HAVE_EVENTLOG:
+            eventlog_write(win32con.EVENTLOG_ERROR_TYPE, 9002, msg)
+        toast("12VHPWR Guard - restarting",
+              f"No sensor for {_span_text(restart_after)}, restarting to recover it.")
+        request_exit(1, stop_event)
+        return True
+
     try:
         while not stop_event.is_set():
             st = get_state()
@@ -2081,11 +2208,20 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
                 minutes = int((time.time() - paused_since) / 60)
                 logger.info(f"Monitoring resumed after {minutes} min paused.")
                 paused_since = None
+                # Time spent paused is not time spent trying to reconnect, so it must
+                # not count towards the self-restart. Starting the clock over is the
+                # simple version of that, and it errs towards waiting longer.
+                if source_lost_at is not None:
+                    source_lost_at = time.time()
 
             # (Re)connect whenever we have no live data source.
             if backend is None:
                 if not try_connect():
-                    stop_event.wait(3)
+                    # Nothing in this process is going to fix a driver session that
+                    # died, so after long enough a fresh one is the only answer.
+                    if maybe_restart_for_sensor_loss():
+                        break
+                    stop_event.wait(RECONNECT_RETRY_SEC)
                     continue
 
                 # A new connection starts its timers from scratch.
@@ -2095,6 +2231,11 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
                 last_over_notice = 0.0
                 pins_missing = False
                 last_sample_time = None
+                # Protected again, whichever backend answered: an HWiNFO fallback is
+                # a source, so it stops the restart clock the same way.
+                source_lost_at = None
+                if getattr(backend, "key", "") == AstralBackend.key:
+                    direct_seen = True
                 # The advisor and the state it drives are always cleared together, so
                 # a purple hold can never outlive the episode that asked for it.
                 advisor.reset()
@@ -2118,6 +2259,10 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
                     last_over_notice = 0.0
                     advisor.reset()
                     set_state(advisory=None, sensor_path_fault=False)
+                    # Belt and braces: a successful read means a successful connect
+                    # cleared this already, but nothing measured across a suspend is
+                    # allowed to survive it.
+                    source_lost_at = None
                     # Readings right after a resume are not trustworthy, so anything
                     # decided on the strength of them is dropped too.
                     if response.engaged:
@@ -2318,6 +2463,10 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
                 backend = None
                 last_sample_time = None
                 set_state(source="")
+
+                # The guard is blind as of now. If it is still blind this long from
+                # here, and the direct sensor is what it lost, the process restarts.
+                source_lost_at = time.time()
 
                 # Re-arm the one-shot notifications for the next outage/recovery.
                 source_missing_notified = False
@@ -2819,6 +2968,7 @@ def tray_title() -> str:
     return f"12VHPWR Guard: OK | Max {max_val:.2f}{max_unit}{src}{adv}{mode}"
 
 def run_tray(stop_event: threading.Event):
+    global TRAY_ICON
     if not HAVE_TRAY:
         raise RuntimeError("pystray/Pillow not installed. Install: pip install pystray pillow")
 
@@ -2887,8 +3037,15 @@ def run_tray(stop_event: threading.Event):
         except Exception:
             pass
 
+    # Published so the monitor thread can end the process through request_exit().
+    # The updater above is the backstop for the moment before this: it watches the
+    # stop event and stops the icon itself.
+    TRAY_ICON = icon
     threading.Thread(target=updater, daemon=True).start()
-    icon.run()
+    try:
+        icon.run()
+    finally:
+        TRAY_ICON = None
 
 # =========================
 # Main
@@ -2914,6 +3071,10 @@ def main():
     t.start()
 
     run_tray(stop_event)
+
+    # 0 for a stop the user asked for, which Task Scheduler leaves alone. 1 when the
+    # guard asked to be restarted, which is what makes the scheduler start it again.
+    sys.exit(pending_exit_code())
 
 if __name__ == "__main__":
     main()

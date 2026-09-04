@@ -57,6 +57,9 @@ This tool adds a last-line, OS-level safety net by:
 - **Windows Event Viewer logging**
 - Quiet rotating file logs
 - **Detects sensor loss** (HWiNFO exit/crash/freeze, or I2C failure) and auto-reconnects; never reports OK on stale data
+- **Recovers from a driver update**: if the card's sensor path dies and stays dead for 5
+  minutes, the guard restarts itself through Task Scheduler and comes back with a fresh driver
+  session
 - **Resets its timer across sleep/resume** instead of trusting a stale reading
 - **Single-instance guard** (a second copy exits instead of double-monitoring)
 - Uses **Task Scheduler as watchdog**
@@ -153,6 +156,36 @@ sensor_backend = auto
   switch if the direct path ever misbehaves.
 
 Changing this requires a restart of the guard.
+
+### When the sensor source goes away
+
+If the source dies (HWiNFO exits or freezes, or an I2C read fails hard enough), the guard drops
+the connection rather than trusting the last values it saw, turns the tray icon purple, and
+tries to connect again every few seconds. Most of the time that works: restart HWiNFO and the
+next attempt picks it up.
+
+One case never works. A driver update, or a driver crash, takes the session the direct backend
+holds with it, and nothing inside the running process ever gets it back. On this project's own
+rig that was 131 reconnect attempts in a row, all failed, with the card unprotected until the
+scheduled task was restarted by hand. A new process gets a new driver session, so since v1.4
+the guard does that itself: if it has **no source at all for 5 minutes** after having read the
+direct sensor earlier in that session, it logs the reason, writes event **9002**, toasts, and
+exits with a failure code. Task Scheduler is configured to restart a failed run (999 times, one
+minute apart), so the guard is back within about a minute with a clean session, and the log
+shows a fresh "Starting" line.
+
+Two cases deliberately never restart:
+
+- **An HWiNFO-only session.** If the direct sensor was never the source, closing HWiNFO is a
+  normal thing to do and restarting over it would be a loop. The guard waits purple, as before.
+- **A session that never connected at all.** An unsupported card, or `sensor_backend = hwinfo`
+  with HWiNFO not running, has no direct session to recover, so a restart would only fail the
+  same way.
+
+Time spent **paused** does not count either: a paused guard is not trying to reconnect, and the
+clock starts over when you resume. The restart is what Task Scheduler makes of a failed run, so
+a guard started by hand from a console has nothing to bring it back and will simply exit. The
+window is `sensor_loss_restart_seconds` in `config.ini`, and `0` turns the whole behaviour off.
 
 ---
 
@@ -556,6 +589,10 @@ the sensor-path check is **7003** (no current on any pin), all three warnings. *
 (cleared) is the information entry that ends any of them. See
 [What it warns about](#what-it-warns-about).
 
+Event ID **9002** (error) is the self-restart after a long sensor loss, described under
+[When the sensor source goes away](#when-the-sensor-source-goes-away). It is followed by the
+usual **1003** stopped entry, and then a **1000** start from the run Task Scheduler brings up.
+
 ---
 
 ## Configuration
@@ -579,6 +616,17 @@ preserves whatever value you set here.
 
 `response_mode` is `tiered` or `shutdown_only`, described under
 [How it responds](#how-it-responds). It is the one setting the tray menu changes at runtime.
+
+**Self-restart.** Optional, read at startup only, described under
+[When the sensor source goes away](#when-the-sensor-source-goes-away):
+
+```ini
+sensor_loss_restart_seconds = 300.0
+```
+
+| Key | Meaning |
+|---|---|
+| `sensor_loss_restart_seconds` | How long the guard goes without any sensor source, after having read the direct sensor, before it exits so Task Scheduler restarts it. `0` turns the self-restart off and it waits instead |
 
 **Tier settings.** These are optional and only read at startup. Leave them out and the
 defaults below apply:

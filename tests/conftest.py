@@ -93,6 +93,9 @@ def guard(tmp_path):
     FakeMitigator.AVAILABLE = True
     FakeBackend.amps = 0.5
     FakeBackend.pins = None
+    FakeBackend.gone = False
+    FakeBackend.connect_ok = True
+    FakeBackend.key = "fake"
 
 
 @pytest.fixture

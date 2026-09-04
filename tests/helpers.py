@@ -109,8 +109,16 @@ class FakeBackend:
     # pattern rather than one hot pin; None keeps the amps behaviour above.
     pins = None
     subsystem_id = 0x89E31043
+    # The F3 tests take the sensor away and keep it away. gone makes every read raise
+    # the way a dead driver session does, connect_ok False makes every reconnect fail,
+    # and key is set to "astral" or "hwinfo" to say which backend is being stood in
+    # for, because the self-restart only applies to the direct one.
+    gone = False
+    connect_ok = True
 
     def connect(self):
+        if not FakeBackend.connect_ok:
+            raise RuntimeError("fake backend cannot connect")
         return "fake sensor"
 
     @property
@@ -118,6 +126,8 @@ class FakeBackend:
         return None
 
     def read_pins(self):
+        if FakeBackend.gone:
+            raise g.SensorGoneError("fake sensor gone")
         if FakeBackend.pins is not None:
             return [(f"GPU 12VHPWR Pin{i} Current", float(a), "A")
                     for i, a in enumerate(FakeBackend.pins, start=1)]
