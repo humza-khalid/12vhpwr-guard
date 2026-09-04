@@ -110,6 +110,39 @@ DEAD_PIN_OTHERS_MIN_AMPS = 3.0
 IMBALANCE_MIN_MAX_AMPS = 5.0
 ADVISORY_CLEAR_SEC = 60.0
 
+# =========================
+# Sensor-path check (v1.4)
+#
+# A BTF card in an actual BTF motherboard is powered through the GC-HPWR slot, so
+# nothing at all flows through the 16-pin cable and the card-side pin sensors read
+# zero however hard the GPU is working. Every rule above would then be measuring a
+# wire that carries no current, and green would be a lie. A dead or unpowered sensor
+# block produces the same readings and deserves the same answer, so the check is
+# about what the sensors report, not about why.
+#
+# Not config keys either: a connector that is carrying nothing is not a tuning
+# question, and there is no number here a user could usefully move.
+# =========================
+# Below this a pin is carrying nothing. A cabled Astral idles at roughly 0.5 to 1.0 A
+# per pin, because the card takes nearly everything through the 16-pin and almost
+# nothing from the slot, so a cabled card cannot look like this.
+NO_CURRENT_AMPS = 0.1
+NO_CURRENT_SUSTAIN_SEC = 60.0
+
+# The optional half of the check (tiered mode only, where NVML is already bound): the
+# card reports real board power while the pins do not add up to anything like it.
+# The PCIe slot supplies at most 75 W, so at 150 W at least 75 W has to cross the
+# connector, which is 6.25 A at 12 V, while 25 % of the current implied by 150 W is
+# only 3.1 A. A correctly sensed cable cannot get under the ratio, so the margin is
+# wide in the direction that matters (no false alarm on a healthy card).
+MISMATCH_MIN_WATTS = 150.0
+MISMATCH_RATIO = 0.25
+MISMATCH_SUSTAIN_SEC = 30.0
+
+# Event Viewer ids for the three kinds the advisor can raise. All three are warnings;
+# the "cleared" line that ends any of them is 7004, information.
+ADVISORY_EVENT_IDS = {"imbalance": 7001, "dead_pin": 7002, "no_current": 7003}
+
 DEFAULT_ADVISORY_VALUES = {
     "advisories_enabled": DEFAULT_ADVISORIES_ENABLED,
     "advisory_load_amps": DEFAULT_ADVISORY_LOAD_AMPS,
@@ -931,9 +964,10 @@ class FlightRecorder:
 class Advisory(NamedTuple):
     """One thing the advisor wants said. The caller decides how to say it."""
 
-    # "dead_pin", "imbalance" or "cleared".
+    # "dead_pin", "imbalance", "no_current" or "cleared".
     kind: str
-    # 1-based pin the advisory is about (the quiet one, or the busiest one).
+    # 1-based pin the advisory is about (the quiet one, or the busiest one). None
+    # when the advisory is about all of them at once.
     pin: Optional[int]
     # Full line for a log file or Event Viewer: numbers and what to do about them.
     message: str
@@ -944,15 +978,27 @@ class Advisory(NamedTuple):
     # True for the first warning of an episode, False for a repeat. A "cleared"
     # advisory is not a warning, so it is never first.
     first: bool
+    # On a "cleared" advisory, the kind of episode that just ended, so the caller can
+    # undo exactly what it did for that kind. None on a warning.
+    ended: Optional[str] = None
 
 
 class PinAdvisor:
-    """Warn-only reading of the per-pin spread. It never mitigates and never stops.
+    """Warn-only reading of the six pins. It never mitigates and never stops.
 
-    The tiers cannot see a fault that lowers every reading, and an open pin is
-    exactly that: the load moves to the pins that are left, and if the card is not
-    near its limit no single pin has to go over threshold for the connector to be in
-    trouble. This looks at the shape of the six readings rather than the biggest one.
+    Two jobs, both of which the absolute per-pin tiers are blind to.
+
+    The shape of the readings. An open pin moves its load to the pins that are left,
+    and if the card is not near its limit no single pin has to go over threshold for
+    the connector to be in trouble. This looks at the spread rather than the biggest
+    reading. Those two kinds are advisories in the ordinary sense and the caller can
+    switch them off.
+
+    The sensor path itself. If every pin reads nothing, the guard is watching a wire
+    that carries no current (slot power on a BTF board, or a dead sensor block) and
+    nothing above this line means anything. That is not an opinion about the cable,
+    it is the guard admitting it cannot see the load, so it is not something the
+    advisories setting can silence.
 
     Deliberately platform neutral: pure logic, no toast, no Event Viewer, no shared
     state, no logger, no clock of its own (every decision uses the `now` handed in).
@@ -987,13 +1033,24 @@ class PinAdvisor:
         # When the reported episode's condition went away, for the clear timer.
         self._absent_since: Optional[float] = None
 
-    def evaluate(self, now: float, pins) -> List[Advisory]:
+    def evaluate(self, now: float, pins, board_power_w: Optional[float] = None,
+                 advisories_enabled: bool = True) -> List[Advisory]:
         """One tick. Returns what should be said this time, usually nothing.
 
         pins is the loop's [(label, amps, unit)] list.
+
+        board_power_w is what the card says it is drawing, when the caller can ask
+        (NVML in tiered mode on Windows). None leaves the power half of the
+        sensor-path check inert, and every other rule works exactly the same.
+
+        advisories_enabled is the user's `advisories` setting, passed per call rather
+        than read from the settings this class was built with, because it gates only
+        the two cable advisories. The sensor-path check runs either way: a guard that
+        cannot see the load has to say so whatever the user asked to be told about.
         """
         out: List[Advisory] = []
-        kind, pin, message, summary, short = self._classify(pins)
+        kind, rule, pin, message, summary, short = self._classify(
+            pins, board_power_w, advisories_enabled)
 
         if kind is None:
             self._kind = None
@@ -1016,7 +1073,7 @@ class PinAdvisor:
         self._absent_since = None
 
         if self._episode is None:
-            if (now - self._since) >= self.sustain_seconds:
+            if (now - self._since) >= self._sustain_for(rule):
                 self._episode = kind
                 self._episode_pin = pin
                 self._last_report = now
@@ -1028,26 +1085,63 @@ class PinAdvisor:
         return out
 
     # ---- internals ----
+    def _sustain_for(self, rule: Optional[str]) -> float:
+        """How long this particular condition has to hold before it is worth saying.
+
+        The two cable advisories share the configured sustain. The sensor-path rules
+        have their own: no current at all is a slower, quieter claim and gets a full
+        minute, while a power reading that contradicts the pins is already specific
+        and only needs half of that. Read from the module at call time so the numbers
+        stay in one place.
+        """
+        return {
+            "no_current_zero": NO_CURRENT_SUSTAIN_SEC,
+            "no_current_power": MISMATCH_SUSTAIN_SEC,
+        }.get(rule, self.sustain_seconds)
+
     def _close_episode(self) -> Advisory:
         """End the reported episode and produce the one line that says so."""
-        name = "dead pin" if self._episode == "dead_pin" else "imbalance"
+        ended = self._episode
         pin = self._episode_pin
-        where = f" on pin {pin}" if pin else ""
-        message = f"Pin advisory cleared: the {name} condition{where} is gone."
+        if ended == "no_current":
+            message = "Sensor path cleared: the pins carry current again."
+        else:
+            name = "dead pin" if ended == "dead_pin" else "imbalance"
+            where = f" on pin {pin}" if pin else ""
+            message = f"Pin advisory cleared: the {name} condition{where} is gone."
         self._episode = None
         self._episode_pin = None
         self._last_report = 0.0
         self._absent_since = None
-        return Advisory("cleared", pin, message, message, "", False)
+        return Advisory("cleared", pin, message, message, "", False, ended)
 
-    def _classify(self, pins):
-        """(kind, pin, message, summary, short) for this sample, kind None if clean."""
-        nothing = (None, None, "", "", "")
+    def _classify(self, pins, board_power_w: Optional[float] = None,
+                  advisories_enabled: bool = True):
+        """(kind, rule, pin, message, summary, short), kind None if clean.
+
+        `rule` names the exact condition inside the kind, because the two
+        sensor-path rules share one kind (and so one episode, one clear) while
+        waiting different lengths of time.
+        """
+        nothing = (None, None, None, "", "", "")
         try:
             amps = [float(a) for _label, a, _unit in pins]
         except Exception:
             return nothing
         if len(amps) < 2:
+            return nothing
+
+        # The sensor path first, and deliberately above the load gate: the gate is
+        # computed from the very readings that are missing, so gating this rule would
+        # be asking a broken sensor for permission to report itself. Zeros are the
+        # whole signal here.
+        sensor_path = self._classify_sensor_path(amps, board_power_w)
+        if sensor_path is not None:
+            return sensor_path
+
+        # Everything below is an advisory about the cable, which the user can switch
+        # off. Nothing above is.
+        if not advisories_enabled:
             return nothing
 
         # Idle noise is not a fault. Nothing can start below the load gate, and an
@@ -1072,7 +1166,8 @@ class PinAdvisor:
                            f"pin or its contact looks open, so the load is going through "
                            f"the rest. Reseat the cable at both ends and check the "
                            f"connector.")
-                return "dead_pin", pin, message, summary, f"pin {pin} near zero"
+                return ("dead_pin", "dead_pin", pin, message, summary,
+                        f"pin {pin} near zero")
 
         hi = max(range(len(amps)), key=lambda i: amps[i])
         lo = min(range(len(amps)), key=lambda i: amps[i])
@@ -1086,10 +1181,54 @@ class PinAdvisor:
                        f"across the connector. Uneven contact resistance puts the heat "
                        f"on the busiest pin. Reseat the cable at both ends and check the "
                        f"connector.")
-            return ("imbalance", pin, message, summary,
+            return ("imbalance", "imbalance", pin, message, summary,
                     f"pin {pin} high, spread {spread:.1f}A")
 
         return nothing
+
+    def _classify_sensor_path(self, amps, board_power_w: Optional[float]):
+        """The sensor-path condition for this sample, or None when the pins look real.
+
+        Two ways to reach the same conclusion, so they share the "no_current" kind and
+        with it one episode and one cleared line. When both are true the power wording
+        wins, because naming the two numbers is a stronger thing to show someone than
+        saying the pins read nothing.
+        """
+        total = sum(amps)
+
+        # The power half. Inert without a reading, and only above a load where the
+        # slot alone cannot be the explanation.
+        if board_power_w is not None and board_power_w >= MISMATCH_MIN_WATTS:
+            expected = board_power_w / 12.0
+            if total < (MISMATCH_RATIO * expected):
+                message = (f"Sensor path: the card draws {board_power_w:.0f} W but the "
+                           f"pins add up to {total:.1f} A (expected about "
+                           f"{expected:.0f} A). The pin sensors are not on the load "
+                           f"path, so this tool cannot protect the card. On a BTF "
+                           f"motherboard with slot (GC-HPWR) power this is expected: "
+                           f"the load bypasses the card-side sensors. See the BTF note "
+                           f"in the README.")
+                summary = (f"The card draws {board_power_w:.0f} W but the pins add up to "
+                           f"{total:.1f} A. This tool cannot protect the card in this "
+                           f"setup.")
+                short = f"pins carry {total:.1f}A of about {expected:.0f}A, not protected"
+                return "no_current", "no_current_power", None, message, summary, short
+
+        # The core half, which needs nothing but the pins and so runs in every
+        # response mode, on every platform.
+        if all(a <= NO_CURRENT_AMPS for a in amps):
+            message = (f"Sensor path: all {len(amps)} pins read {NO_CURRENT_AMPS:.2f} A "
+                       f"or less for {NO_CURRENT_SUSTAIN_SEC:.0f} s. The pin sensors see "
+                       f"no current, so this tool cannot protect the card. On a BTF "
+                       f"motherboard with slot (GC-HPWR) power this is expected: the "
+                       f"load bypasses the card-side sensors. See the BTF note in the "
+                       f"README.")
+            summary = ("The pin sensors see no current. This tool cannot protect the "
+                       "card in this setup.")
+            return ("no_current", "no_current_zero", None, message, summary,
+                    "no current on any pin, not protected")
+
+        return None
 
 
 def candidate_backends(logger: logging.Logger) -> List[object]:
@@ -1609,6 +1748,10 @@ shared = {
     # A few words about a live pin advisory, None when there is nothing to say.
     # Advisories never change the icon: the guard has not acted on anything.
     "advisory": None,
+    # True while the pins report no current at all. This one does change the icon:
+    # purple already means "cannot protect", and a guard that cannot see the load has
+    # no business showing green. Cleared when the pins carry current again.
+    "sensor_path_fault": False,
 }
 
 def set_state(**kwargs):
@@ -1675,6 +1818,13 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
         )
     else:
         logger.info("Advisories: off")
+    # Says which half of the sensor-path check is running. The pin half runs in both
+    # modes and is never silenced by `advisories = off`; only the board power reading
+    # needs NVML, which shutdown-only mode does not touch.
+    if get_response_mode() == RESPONSE_TIERED:
+        logger.info("Sensor-path check: pins and board power")
+    else:
+        logger.info("Sensor-path check: pins only (no NVML in shutdown-only mode)")
     toast("12VHPWR Guard", "Monitoring started.")
     if HAVE_EVENTLOG:
         eventlog_write(win32con.EVENTLOG_INFORMATION_TYPE, 1000, "12VHPWR Guard started.")
@@ -1748,28 +1898,72 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
         """Say one advisory out loud. Nothing here touches the GPU or the machine.
 
         PinAdvisor stays platform neutral, so every Windows-specific part of an
-        advisory (toast, Event Viewer, tray tooltip) happens here instead.
+        advisory (toast, Event Viewer, tray tooltip, icon colour) happens here instead.
         """
         if adv.kind == "cleared":
             logger.info(adv.message)
             if HAVE_EVENTLOG:
                 eventlog_write(win32con.EVENTLOG_INFORMATION_TYPE, 7004, adv.message)
-            set_state(advisory=None)
+            if adv.ended == "no_current":
+                # The pins carry current again, so the readings mean something again
+                # and the icon is allowed back to green on the next tick.
+                set_state(advisory=None, sensor_path_fault=False)
+            else:
+                set_state(advisory=None)
             return
 
         logger.warning(adv.message)
         if HAVE_EVENTLOG:
-            eventlog_write(
-                win32con.EVENTLOG_WARNING_TYPE,
-                7002 if adv.kind == "dead_pin" else 7001,
-                adv.message,
-            )
-        set_state(advisory=adv.short)
-        toast("12VHPWR Guard - advisory", adv.summary)
+            eventlog_write(win32con.EVENTLOG_WARNING_TYPE,
+                           ADVISORY_EVENT_IDS.get(adv.kind, 7001), adv.message)
+        if adv.kind == "no_current":
+            # Not a warning about the cable but about this tool: it is watching a wire
+            # that carries nothing. The flag holds the icon purple until it is cleared.
+            set_state(advisory=adv.short, sensor_path_fault=True)
+            toast("12VHPWR Guard - not protected", adv.summary)
+        else:
+            set_state(advisory=adv.short)
+            toast("12VHPWR Guard - advisory", adv.summary)
         if adv.first:
             # The minute before the first warning is the evidence: it is what an RMA
             # claim or a bug report needs, and the fault may not repeat on demand.
             flight.dump(logger, "advisory")
+
+    def set_ok_status(message: str) -> None:
+        """Report a healthy tick, unless the guard cannot see the load at all.
+
+        OVER, MITIGATED and SHUTDOWN are set elsewhere and still win: those come from
+        readings that are plainly real, and they are acted on whatever the sensor path
+        looks like. This is only about the guard's right to say OK.
+        """
+        if get_state().get("sensor_path_fault"):
+            set_state(status=Status.ERROR,
+                      last_message="Not protected: the pin sensors see no current")
+        else:
+            set_state(status=Status.OK, last_message=message)
+
+    def board_power_watts() -> Optional[float]:
+        """What the card says it is drawing, or None when we cannot ask.
+
+        Shutdown-only mode reads nothing here, and the mode is checked rather than
+        left to ensure_mitigator() returning None, so the promise holds even for a
+        session that was switched out of tiered mode with a handle already bound.
+        In tiered mode this asks the mitigator the loop already has, which the
+        response ladder has bound on the first tick anyway, so nothing new is loaded.
+        Best effort by construction: the mitigator is injectable, and losing a
+        monitoring tick over an enrichment reading would be a worse bug than not
+        having the number.
+        """
+        if get_response_mode() != RESPONSE_TIERED:
+            return None
+        m = ensure_mitigator()
+        if m is None or not m.is_available:
+            return None
+        try:
+            milliwatts = m.power_usage_mw()
+        except Exception:
+            return None
+        return None if milliwatts is None else float(milliwatts) / 1000.0
 
     def try_connect() -> bool:
         """One pass over the candidate backends. True as soon as one connects."""
@@ -1866,7 +2060,7 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
                     # Nothing is being watched from here on, so a half-formed
                     # advisory must not survive the pause either.
                     advisor.reset()
-                    set_state(advisory=None)
+                    set_state(advisory=None, sensor_path_fault=False)
                 if response.engaged:
                     # Pausing hands the decision back to the user. Leaving their GPU
                     # crippled while no longer watching it is not ours to do.
@@ -1901,7 +2095,10 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
                 last_over_notice = 0.0
                 pins_missing = False
                 last_sample_time = None
+                # The advisor and the state it drives are always cleared together, so
+                # a purple hold can never outlive the episode that asked for it.
                 advisor.reset()
+                set_state(advisory=None, sensor_path_fault=False)
 
             try:
                 pins = backend.read_pins()
@@ -1920,6 +2117,7 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
                     consecutive_over = 0
                     last_over_notice = 0.0
                     advisor.reset()
+                    set_state(advisory=None, sensor_path_fault=False)
                     # Readings right after a resume are not trustworthy, so anything
                     # decided on the strength of them is dropped too.
                     if response.engaged:
@@ -1952,10 +2150,16 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
                 flight.record(pins)
 
                 # Warn only, and completely separate from the threshold logic below:
-                # an advisory never engages the mitigator and never shuts down.
-                if get_advisory_values()["advisories_enabled"]:
-                    for adv in advisor.evaluate(sample_now, pins):
-                        render_advisory(adv)
+                # nothing the advisor says ever engages the mitigator or shuts down.
+                # The advisor runs on every tick whatever `advisories` is set to: the
+                # flag goes in as an argument and silences the two cable advisories
+                # only, never the sensor-path check.
+                for adv in advisor.evaluate(
+                    sample_now, pins,
+                    board_power_w=board_power_watts(),
+                    advisories_enabled=get_advisory_values()["advisories_enabled"],
+                ):
+                    render_advisory(adv)
 
                 max_label, max_val, max_unit = max(pins, key=lambda x: x[1])
                 set_state(max_label=max_label, max_val=max_val, max_unit=max_unit)
@@ -2014,7 +2218,7 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
                             )
 
                 elif cleared:
-                    set_state(status=Status.OK, last_message=f"OK (max {max_val:.2f}{max_unit})")
+                    set_ok_status(f"OK (max {max_val:.2f}{max_unit})")
                     consecutive_over = 0
 
                     if clear_start is None:
@@ -2033,7 +2237,7 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
                         last_over_notice = 0.0
 
                 else:
-                    set_state(status=Status.OK, last_message=f"OK (near threshold: {max_val:.2f}{max_unit})")
+                    set_ok_status(f"OK (near threshold: {max_val:.2f}{max_unit})")
                     consecutive_over = 0
                     clear_start = None
 
@@ -2092,7 +2296,7 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
                 # The advisory timers go with it: a condition seen before a blind
                 # spell was not observed across it.
                 advisor.reset()
-                set_state(advisory=None)
+                set_state(advisory=None, sensor_path_fault=False)
                 if response.engaged:
                     # Deliberately stays engaged. We limited the card because the
                     # current was dangerous, and losing the ability to measure is not
@@ -2602,6 +2806,11 @@ def tray_title() -> str:
     if status == Status.MISSING:
         return "12VHPWR Guard: Sensors missing"
     if status == Status.ERROR:
+        # Purple has always meant "cannot protect". There are two ways to get here
+        # now, so say which one: no readings at all, or readings that carry nothing.
+        if st.get("sensor_path_fault"):
+            detail = advisory or "the pin sensors see no current"
+            return f"12VHPWR Guard: NOT PROTECTED | {detail}{src}"
         return "12VHPWR Guard: Waiting for pin sensors"
 
     # Protection must never weaken silently: if a tier crossing is going straight to

@@ -181,6 +181,11 @@ class _Nvml:
                    [ctypes.c_void_p, c_uint_p, c_uint_p])
         self._bind("nvmlDeviceSetPowerManagementLimit", ctypes.c_int,
                    [ctypes.c_void_p, ctypes.c_uint32])
+        # Read-only, and optional: the guard uses it to tell a card that is drawing
+        # real power through a slot from one that is drawing nothing at all. A driver
+        # that does not export it must not cost the guard its mitigation.
+        self._bind("nvmlDeviceGetPowerUsage", ctypes.c_int,
+                   [ctypes.c_void_p, c_uint_p], required=False)
         self._bind("nvmlDeviceSetGpuLockedClocks", ctypes.c_int,
                    [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32])
         self._bind("nvmlDeviceResetGpuLockedClocks", ctypes.c_int, [ctypes.c_void_p])
@@ -230,6 +235,12 @@ class _Nvml:
         limit = ctypes.c_uint32(0)
         self._call("nvmlDeviceGetPowerManagementLimit", handle, ctypes.byref(limit))
         return int(limit.value)
+
+    def power_usage_mw(self, handle) -> int:
+        """What the board is drawing right now. Raises if the driver lacks the call."""
+        usage = ctypes.c_uint32(0)
+        self._call("nvmlDeviceGetPowerUsage", handle, ctypes.byref(usage))
+        return int(usage.value)
 
     def power_limit_constraints_mw(self, handle) -> Tuple[int, int]:
         lo = ctypes.c_uint32(0)
@@ -710,7 +721,8 @@ class GpuMitigator:
             except Exception:
                 pass
 
-    # -- observation (used by the tools, never by the decision path) --------
+    # -- observation (the tools and the guard's sensor-path check; never a decision
+    #    about limiting the card or shutting the machine down) ---------------
     def graphics_clock_mhz(self) -> Optional[int]:
         if not self.is_available:
             return None
@@ -720,6 +732,18 @@ class GpuMitigator:
         if not self.is_available:
             return None
         return self._safe(lambda: self._nvml.power_limit_mw(self._handle), None)
+
+    def power_usage_mw(self) -> Optional[int]:
+        """Board power draw in milliwatts, or None. Never raises.
+
+        None covers all three ways of not knowing: no connection, a driver without
+        the call (the binding is optional), and a call that failed. The caller only
+        ever uses this to add numbers to a message, so a missing reading costs it a
+        detail and nothing else.
+        """
+        if not self.is_available:
+            return None
+        return self._safe(lambda: self._nvml.power_usage_mw(self._handle), None)
 
     def close(self) -> None:
         """Release mitigation, then drop NVML. Never leaves the card limited."""

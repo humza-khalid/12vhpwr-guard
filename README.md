@@ -42,6 +42,8 @@ This tool adds a last-line, OS-level safety net by:
   when, so a trip while you were away is not a mystery
 - **Warns about a dead or imbalanced pin** before it becomes dangerous, without touching the
   GPU
+- **Never shows green when it cannot see the load**: pins carrying no current (slot power on a
+  BTF board, or a dead sensor block) turn the icon purple and say so, in every response mode
 - **Flight recorder**: the last minute of per-pin samples is saved to `logs/` whenever the
   guard acts, evidence for a bug report or an RMA claim
 - **Force-closes blocking apps** during shutdown so nothing can stall it (on by default; `SHUTDOWN_FORCE_CLOSE_APPS` in the source)
@@ -85,7 +87,11 @@ chip that measures each 12VHPWR pin individually. Recognized models (by PCI subs
 in a standard motherboard, which is where its card-side sensors sit. Installed in an actual
 BTF motherboard (power through the GC-HPWR slot connector), the load bypasses those sensors:
 the guard would read near zero on every pin and could not protect anything. Do not rely on
-this tool for a GC-HPWR powered card.
+this tool for a GC-HPWR powered card. Since v1.4 the guard says so itself rather than leaving
+you to read this paragraph: within a minute of starting on a slot-powered card the tray icon
+turns purple and the tooltip reads "NOT PROTECTED", with the reason in the log and in Event
+Viewer. That check runs in every response mode and cannot be switched off, because it is not
+a warning about your cable, it is the guard telling you it cannot see the load.
 
 Have an Astral variant that is not in this table (the guard sits purple)? Run
 `nvidia-smi --query-gpu=name,pci.sub_device_id --format=csv` and open an issue with the
@@ -273,10 +279,32 @@ at least **18 A** (about 215 W) before either rule can start, so idle noise cann
 condition has to hold for **10 s** before the first warning, then repeats at most every
 **10 minutes** while it lasts, and logs one "cleared" line once it has been gone for a minute.
 
+There is a third thing it watches, and this one is about the guard rather than the cable:
+
+- **No current on any pin** - all six pins read **0.1 A or less** for a full **minute** while
+  the guard is connected. Nothing is flowing through the connector it is watching, so nothing
+  above this line means anything: the readings would sit at a comfortable zero no matter what
+  the card was doing. That is what a BTF card powered through the GC-HPWR slot looks like (see
+  the BTF note under [Hardware Compatibility](#hardware-compatibility)), and it is also what a
+  dead or unpowered sensor block looks like. Either way the answer is the same, so the guard
+  stops showing green: the icon goes **purple**, which has always meant "cannot protect", and
+  the tooltip reads "NOT PROTECTED". It goes back to green a minute after the pins carry
+  current again. A cabled Astral cannot look like this, because it idles at roughly 0.5 to
+  1.0 A per pin: it takes nearly everything through the 16-pin and almost nothing from the
+  slot. In tiered mode the guard also compares the pins against the board power the card
+  reports (above **150 W**, pins adding up to less than a **quarter** of what that power
+  implies, for **30 s**), which catches the partial case where slot and cable are both
+  connected. That message names both numbers.
+
+  Unlike the two above, **`advisories = off` does not silence this one**, and neither does
+  shutdown-only mode. It is not an opinion about your hardware that you might not want; it is
+  the guard admitting it cannot see the load, and a tool that hides that is worse than no tool.
+
 **An advisory never does anything to your machine.** It is a toast, a log line, an Event Viewer
-entry and a tooltip suffix, and that is all. It never limits the GPU, never shuts down, never
-changes the tray icon colour, and never touches the tiers above. The guard has not acted,
-because there is nothing here for it to act on yet.
+entry and a tooltip suffix, and that is all. It never limits the GPU, never shuts down, and
+never touches the tiers above. The guard has not acted, because there is nothing here for it to
+act on yet. The one thing any of this changes is the icon colour, and only for the no-current
+case, where green would be a lie.
 
 At the **first** warning of an episode the guard writes `logs/flight_*_advisory.csv`, the last
 minute of per-pin readings. That file is the evidence, and the fault may not repeat on demand:
@@ -295,8 +323,9 @@ advisory_sustain_seconds = 10.0
 advisory_repeat_seconds = 600.0
 ```
 
-Set `advisories = off` to silence them completely. Like the tier settings, these are read at
-startup only, and the tray menu never touches them.
+Set `advisories = off` to silence the dead-pin and imbalance warnings completely. The
+sensor-path check is not one of them and keeps running either way. Like the tier settings,
+these are read at startup only, and the tray menu never touches them.
 
 ---
 
@@ -460,15 +489,19 @@ If you prefer not to use the installer or need a custom setup:
 | Amber | Over threshold |
 | Orange | GPU limited, waiting for the current to clear |
 | Red | Shutdown triggered |
-| Purple | No sensor source / waiting to reconnect (not monitoring) |
+| Purple | Cannot protect: no sensor source, or the pins carry no current |
 | Gray | Source connected, but per-pin sensors not found |
 | Blue | Paused |
 
-**Purple vs. Gray:** purple means the guard currently has **no data source**: no supported
-Astral card could be read directly, and HWiNFO shared memory is not available (not running,
-exited, or frozen). Gray means a source is connected but the six per-pin sensors are missing;
-with the `hwinfo` backend that usually means renamed or disabled sensors, so check the names
-under [HWiNFO Configuration](#hwinfo-configuration). In both cases **no protection is active**.
+**Purple vs. Gray:** purple means the guard cannot protect the card, for one of two reasons.
+Either it has **no data source** (no supported Astral card could be read directly and HWiNFO
+shared memory is not available: not running, exited, or frozen), or it has readings that carry
+**no current at all**, which is the sensor-path check under
+[What it warns about](#what-it-warns-about). The tooltip says which: "Waiting for pin sensors"
+against "NOT PROTECTED". Gray means a source is connected but the six per-pin sensors are
+missing; with the `hwinfo` backend that usually means renamed or disabled sensors, so check the
+names under [HWiNFO Configuration](#hwinfo-configuration). In all of these cases **no
+protection is active**.
 
 Hovering the icon shows the current status, the highest pin current, and the active data
 source (`... | direct` or `... | HWiNFO`). While the GPU is limited the tooltip reads
@@ -518,8 +551,9 @@ Source: 12VHPWR Guard
 Every setting you change from the tray is written to the log and to Event Viewer (event ID
 1010) with its old and new value, so a trip can be read against the settings that were live.
 
-The warn-only pin advisories are event IDs **7001** (imbalance) and **7002** (dead pin), both
-warnings, and **7004** (advisory cleared), information. See
+The warn-only pin advisories are event IDs **7001** (imbalance) and **7002** (dead pin), and
+the sensor-path check is **7003** (no current on any pin), all three warnings. **7004**
+(cleared) is the information entry that ends any of them. See
 [What it warns about](#what-it-warns-about).
 
 ---
