@@ -461,6 +461,9 @@ Event Viewer > Windows Logs > Application
 Source: 12VHPWR Guard
 ```
 
+Every setting you change from the tray is written to the log and to Event Viewer (event ID
+1010) with its old and new value, so a trip can be read against the settings that were live.
+
 ---
 
 ## Configuration

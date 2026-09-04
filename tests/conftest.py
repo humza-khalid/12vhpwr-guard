@@ -35,6 +35,7 @@ from helpers import FakeBackend, FakeMitigator  # noqa: E402
 # subset. On a clean tree the restored values are the documented defaults:
 # tiered response, PAUSE_REMINDER_EVERY_SEC 1800.0, the DEFAULT_TIER_VALUES.
 RESTORED_GLOBALS = (
+    "LOGGER",
     "CONFIG_PATH",
     "LOG_DIR",
     "LAST_SHUTDOWN_PATH",

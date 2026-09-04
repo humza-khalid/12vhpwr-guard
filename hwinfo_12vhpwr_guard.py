@@ -120,6 +120,13 @@ LOG_PATH = os.path.join(LOG_DIR, "12vhpwr_guard.log")
 LOG_MAX_BYTES = 2 * 1024 * 1024
 LOG_BACKUP_COUNT = 5
 
+# The one logger, published by main() so the tray callbacks can write to the same
+# file the monitor thread does. They run on the tray thread and are handed no
+# logger of their own, and a setting the user changed has to be in the log before
+# the trip line that the new value caused. None until main() runs (and under
+# tests), so every use has to tolerate that.
+LOGGER: Optional[logging.Logger] = None
+
 # Config file
 CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
 
@@ -2050,6 +2057,23 @@ def confirm_unsafe_value(kind: str, new_value: float, default_value: float, unit
         f"Apply anyway?"
     )
 
+def log_setting_change(what: str, old, new) -> None:
+    """One line and one Event Viewer entry per setting the user actually changed.
+
+    Callers reach here only once the new value is live, so a cancelled dialog, a
+    declined warning and a value that did not move all leave no trace. Without
+    this the log's first sign of a lowered threshold is the trip it caused, which
+    reads like the guard fired on its own.
+
+    LOGGER is None before main() publishes it (and under tests); a tray click must
+    not blow up on that, so the line is simply dropped.
+    """
+    msg = f"Setting changed by user: {what} {old} -> {new}"
+    if LOGGER is not None:
+        LOGGER.info(msg)
+    if HAVE_EVENTLOG:
+        eventlog_write(win32con.EVENTLOG_INFORMATION_TYPE, 1010, msg)
+
 def change_threshold_amps(_icon, _item):
     """Open dialog to change threshold amps setting."""
     if dialog is None:
@@ -2066,6 +2090,12 @@ def change_threshold_amps(_icon, _item):
     if not confirm_unsafe_value("threshold", new_value, DEFAULT_THRESHOLD_AMPS, "A"):
         return
     set_config_values(new_value, sustained)
+    # Logged on the applied value, not the saved one: a config.ini write that fails
+    # still leaves this session monitoring at the new threshold.
+    if new_value != current_threshold:
+        log_setting_change(
+            "threshold", f"{current_threshold:.2f} A", f"{new_value:.2f} A"
+        )
     if save_config(new_value, sustained):
         toast("12VHPWR Guard", f"Threshold updated to {new_value:.2f} A")
     else:
@@ -2089,6 +2119,10 @@ def change_sustained_seconds(_icon, _item):
     ):
         return
     set_config_values(threshold, new_value)
+    if new_value != current_sustained:
+        log_setting_change(
+            "sustained seconds", f"{current_sustained:.1f} s", f"{new_value:.1f} s"
+        )
     if save_config(threshold, new_value):
         toast("12VHPWR Guard", f"Sustained seconds updated to {new_value:.1f} s")
     else:
@@ -2105,7 +2139,21 @@ def reset_to_defaults(_icon, _item):
     )
     if not ok:
         return
-    if reset_config_to_defaults():
+    old_threshold, old_sustained = get_config_values()
+    saved = reset_config_to_defaults()
+    # One line per value that moved, so a reset from defaults is silent rather than
+    # two lines saying nothing changed.
+    if old_threshold != DEFAULT_THRESHOLD_AMPS:
+        log_setting_change(
+            "threshold", f"{old_threshold:.2f} A", f"{DEFAULT_THRESHOLD_AMPS:.2f} A"
+        )
+    if old_sustained != DEFAULT_SUSTAINED_SECONDS_REQUIRED:
+        log_setting_change(
+            "sustained seconds",
+            f"{old_sustained:.1f} s",
+            f"{DEFAULT_SUSTAINED_SECONDS_REQUIRED:.1f} s",
+        )
+    if saved:
         toast("12VHPWR Guard", "Settings reset to defaults")
     else:
         toast("12VHPWR Guard", "Failed to reset settings")
@@ -2134,9 +2182,11 @@ def apply_response_mode(mode: str) -> None:
     two, and the tier timings apply either way. That is unlike raising a threshold,
     which does reduce protection and still asks.
     """
-    if get_response_mode() == mode:
+    current = get_response_mode()
+    if current == mode:
         return
     set_response_mode(mode)
+    log_setting_change("response mode", current, mode)
     saved = save_setting("response_mode", mode)
 
     if mode == RESPONSE_TIERED:
@@ -2168,7 +2218,15 @@ def open_log():
 
 def toggle_pause(_icon, _item):
     st = get_state()
-    set_state(paused=not st.get("paused", False))
+    was_paused = bool(st.get("paused", False))
+    set_state(paused=not was_paused)
+    # The loop logs how long a pause lasted once it resumes; this says who started
+    # and ended it, and when.
+    log_setting_change(
+        "monitoring",
+        "paused" if was_paused else "running",
+        "running" if was_paused else "paused",
+    )
 
 def toggle_autostart(_icon, _item):
     state = autostart_state(force=True)
@@ -2185,6 +2243,11 @@ def toggle_autostart(_icon, _item):
 
     target = not state
     if set_autostart(target):
+        # Only once the task itself reads back changed. A declined UAC prompt or a
+        # failed schtasks call leaves the setting alone, so there is nothing to log.
+        log_setting_change(
+            "autostart", "on" if state else "off", "on" if target else "off"
+        )
         toast(
             "12VHPWR Guard",
             f"Start with Windows {'enabled' if target else 'disabled'}.",
@@ -2307,7 +2370,7 @@ def run_tray(stop_event: threading.Event):
 # Main
 # =========================
 def main():
-    global dialog
+    global dialog, LOGGER
 
     # Two guards would mean two tray icons and two shutdown commands.
     if not acquire_single_instance():
@@ -2315,6 +2378,9 @@ def main():
         sys.exit(0)
 
     logger = setup_logger()
+    # Published before the tray starts, so the first setting the user changes is
+    # already logged. The monitor thread below gets the same instance.
+    LOGGER = logger
     stop_event = threading.Event()
 
     # Create dialog service (dedicated Tk thread) before starting tray
