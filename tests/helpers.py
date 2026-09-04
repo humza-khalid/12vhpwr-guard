@@ -105,6 +105,9 @@ class FakeBackend:
     key = "fake"
     tag = "fake"
     amps = 0.5
+    # Set to six values to drive every pin at once. The advisory tests need a whole
+    # pattern rather than one hot pin; None keeps the amps behaviour above.
+    pins = None
     subsystem_id = 0x89E31043
 
     def connect(self):
@@ -115,6 +118,9 @@ class FakeBackend:
         return None
 
     def read_pins(self):
+        if FakeBackend.pins is not None:
+            return [(f"GPU 12VHPWR Pin{i} Current", float(a), "A")
+                    for i, a in enumerate(FakeBackend.pins, start=1)]
         return [(f"GPU 12VHPWR Pin{i} Current",
                  FakeBackend.amps if i == 3 else 0.5, "A") for i in range(1, 7)]
 

@@ -64,6 +64,7 @@ def guard(tmp_path):
     """
     saved = {name: getattr(g, name) for name in RESTORED_GLOBALS}
     saved_tiers = dict(g.TIER_VALUES)
+    saved_advisories = dict(g.ADVISORY_VALUES)
     saved_shared = dict(g.shared)
 
     toasts = []
@@ -81,14 +82,17 @@ def guard(tmp_path):
 
     for name, value in saved.items():
         setattr(g, name, value)
-    # Both are mutated in place by set_tier_values() and set_state(), so putting
-    # the object back is not enough.
+    # These are mutated in place by set_tier_values(), set_advisory_values() and
+    # set_state(), so putting the object back is not enough.
     g.TIER_VALUES.clear()
     g.TIER_VALUES.update(saved_tiers)
+    g.ADVISORY_VALUES.clear()
+    g.ADVISORY_VALUES.update(saved_advisories)
     g.shared.clear()
     g.shared.update(saved_shared)
     FakeMitigator.AVAILABLE = True
     FakeBackend.amps = 0.5
+    FakeBackend.pins = None
 
 
 @pytest.fixture

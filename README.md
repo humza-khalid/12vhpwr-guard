@@ -40,6 +40,8 @@ This tool adds a last-line, OS-level safety net by:
   fault clears, including after a crash
 - **Tells you why**: after an emergency shutdown, the next start shows what happened and
   when, so a trip while you were away is not a mystery
+- **Warns about a dead or imbalanced pin** before it becomes dangerous, without touching the
+  GPU
 - **Flight recorder**: the last minute of per-pin samples is saved to `logs/` whenever the
   guard acts, evidence for a bug report or an RMA claim
 - **Force-closes blocking apps** during shutdown so nothing can stall it (on by default; `SHUTDOWN_FORCE_CLOSE_APPS` in the source)
@@ -243,6 +245,58 @@ already runs at the highest privileges, so a normally installed guard can do it.
 started by hand from a normal console cannot: it logs a warning, the tray tooltip reads
 `shutdown-only`, the menu shows why, and protection falls back to shutting down. It never
 silently pretends to have a capability it does not have.
+
+---
+
+## What it warns about
+
+Everything above acts on **absolute** per-pin current, because that is what melts a connector.
+That leaves one blind spot, and a community member put real numbers on it in PR #2: at a 540 W
+power limit, a connector with **one open pin** puts 44.8 A through the five that are left, so
+each carries 8.96 A. That is under the 9.5 A tier 1 trip. Nothing is over threshold, the guard
+stays green, and the connector is running on five wires with a hot spot where the sixth should
+be. Invisible to a threshold, obvious in the spread.
+
+So the guard also watches the **shape** of the six readings, and says something when it looks
+wrong:
+
+- **Dead pin** - one pin reads at or below **0.5 A** while the other five average **3.0 A** or
+  more. That pin, or its contact, is open. If more than one pin is near zero, the message names
+  the quietest and says how many.
+- **Imbalance** - the gap between the busiest and the quietest pin is **3.0 A** or more, with
+  the busiest at **5.0 A** or more, and no dead pin. Uneven contact resistance puts the heat on
+  the busiest pin. For scale, a healthy Astral in this project's own logs runs a 0.7 A spread at
+  7.5 A per pin, so 3.0 A has real margin.
+
+Both only apply while the connector is actually carrying something: the six pins have to total
+at least **18 A** (about 215 W) before either rule can start, so idle noise cannot trip them. A
+condition has to hold for **10 s** before the first warning, then repeats at most every
+**10 minutes** while it lasts, and logs one "cleared" line once it has been gone for a minute.
+
+**An advisory never does anything to your machine.** It is a toast, a log line, an Event Viewer
+entry and a tooltip suffix, and that is all. It never limits the GPU, never shuts down, never
+changes the tray icon colour, and never touches the tiers above. The guard has not acted,
+because there is nothing here for it to act on yet.
+
+At the **first** warning of an episode the guard writes `logs/flight_*_advisory.csv`, the last
+minute of per-pin readings. That file is the evidence, and the fault may not repeat on demand:
+reseat the cable at both ends, look at the pins in the connector for discolouration or a
+retracted terminal, and keep the file if you end up filing an RMA.
+
+Advisories are configured in `config.ini` and are on by default:
+
+```ini
+[Settings]
+advisories = on
+advisory_load_amps = 18.0
+dead_pin_max_amps = 0.5
+imbalance_spread_amps = 3.0
+advisory_sustain_seconds = 10.0
+advisory_repeat_seconds = 600.0
+```
+
+Set `advisories = off` to silence them completely. Like the tier settings, these are read at
+startup only, and the tray menu never touches them.
 
 ---
 
@@ -464,6 +518,10 @@ Source: 12VHPWR Guard
 Every setting you change from the tray is written to the log and to Event Viewer (event ID
 1010) with its old and new value, so a trip can be read against the settings that were live.
 
+The warn-only pin advisories are event IDs **7001** (imbalance) and **7002** (dead pin), both
+warnings, and **7004** (advisory cleared), information. See
+[What it warns about](#what-it-warns-about).
+
 ---
 
 ## Configuration
@@ -509,6 +567,27 @@ retrigger_window_seconds = 600.0
 | `mitigation_clear_seconds` | How long all pins must stay clear before the limit lifts |
 | `mitigation_min_hold_seconds` | Minimum time the limit stays on regardless of how fast the current falls |
 | `retrigger_window_seconds` | A tier firing again this soon after a release is a persistent fault, and shuts down |
+
+**Advisory settings.** Also optional, also read at startup only, described under
+[What it warns about](#what-it-warns-about). Leave them out and the defaults below apply:
+
+```ini
+advisories = on
+advisory_load_amps = 18.0
+dead_pin_max_amps = 0.5
+imbalance_spread_amps = 3.0
+advisory_sustain_seconds = 10.0
+advisory_repeat_seconds = 600.0
+```
+
+| Key | Meaning |
+|---|---|
+| `advisories` | `on` or `off`. Off silences the warn-only advisories completely |
+| `advisory_load_amps` | The six pins must total at least this before any advisory can start |
+| `dead_pin_max_amps` | A pin at or below this, while the others average 3.0 A or more, is an open pin |
+| `imbalance_spread_amps` | Busiest minus quietest pin at or above this (with the busiest at 5.0 A or more) is an imbalance |
+| `advisory_sustain_seconds` | How long a condition must hold before the first warning |
+| `advisory_repeat_seconds` | How often a warning repeats while the condition lasts |
 
 ### Default Safety Settings
 

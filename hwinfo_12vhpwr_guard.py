@@ -13,7 +13,7 @@ import queue
 import xml.etree.ElementTree as ET
 from collections import deque
 from logging.handlers import RotatingFileHandler
-from typing import List, Tuple, Optional
+from typing import List, NamedTuple, Tuple, Optional
 
 # =========================
 # CONFIG
@@ -81,6 +81,48 @@ DEFAULT_TIER_VALUES = {
 }
 TIER_VALUES = dict(DEFAULT_TIER_VALUES)
 RESPONSE_MODE = DEFAULT_RESPONSE_MODE
+
+# =========================
+# Pin advisories (v1.4, warn only)
+#
+# The tiers above act on absolute per-pin current, which is what melts a connector.
+# That leaves them blind to a fault which lowers every reading: at a 540 W limit one
+# open pin puts 44.8 A through the surviving five, 8.96 A each, under the 9.5 A trip.
+# Nothing is over threshold and the connector is in trouble. The advisories read the
+# spread between the pins instead, and only ever talk: they never limit the GPU and
+# never shut anything down.
+# =========================
+DEFAULT_ADVISORIES_ENABLED = True
+
+# About 215 W through the connector. Below it the numbers are too small to tell a
+# fault from sensor noise, so nothing can start.
+DEFAULT_ADVISORY_LOAD_AMPS = 18.0
+DEFAULT_DEAD_PIN_MAX_AMPS = 0.5
+DEFAULT_IMBALANCE_SPREAD_AMPS = 3.0
+DEFAULT_ADVISORY_SUSTAIN_SECONDS = 10.0
+DEFAULT_ADVISORY_REPEAT_SECONDS = 600.0
+
+# Not config keys: these qualify a rule rather than tune it. The others have to be
+# carrying real current before one quiet pin means anything, a spread only matters
+# once the busiest pin is working, and a condition that has been gone for a minute
+# is over.
+DEAD_PIN_OTHERS_MIN_AMPS = 3.0
+IMBALANCE_MIN_MAX_AMPS = 5.0
+ADVISORY_CLEAR_SEC = 60.0
+
+DEFAULT_ADVISORY_VALUES = {
+    "advisories_enabled": DEFAULT_ADVISORIES_ENABLED,
+    "advisory_load_amps": DEFAULT_ADVISORY_LOAD_AMPS,
+    "dead_pin_max_amps": DEFAULT_DEAD_PIN_MAX_AMPS,
+    "imbalance_spread_amps": DEFAULT_IMBALANCE_SPREAD_AMPS,
+    "advisory_sustain_seconds": DEFAULT_ADVISORY_SUSTAIN_SECONDS,
+    "advisory_repeat_seconds": DEFAULT_ADVISORY_REPEAT_SECONDS,
+}
+ADVISORY_VALUES = dict(DEFAULT_ADVISORY_VALUES)
+
+# The on/off flag lives in the file under "advisories"; the dict key spells out
+# what the value means.
+ADVISORIES_CONFIG_KEY = "advisories"
 
 # Which sensor source to use: "auto" prefers the card's own chip and falls back to
 # HWiNFO; "astral" and "hwinfo" pin it to one. Set "hwinfo" to roll back the direct
@@ -160,6 +202,21 @@ ERROR_ALREADY_EXISTS = 183
 # =========================
 # Config file management (INI format)
 # =========================
+_TRUE_WORDS = ("on", "true", "yes", "1")
+_FALSE_WORDS = ("off", "false", "no", "0")
+
+def _config_bool(config, key: str, fallback: bool) -> bool:
+    """Read an on/off style key. Anything unrecognised keeps the default."""
+    raw = config.get("Settings", key, fallback=None)
+    if raw is None:
+        return fallback
+    word = str(raw).strip().lower()
+    if word in _TRUE_WORDS:
+        return True
+    if word in _FALSE_WORDS:
+        return False
+    return fallback
+
 def load_config() -> dict:
     """
     Load configuration from config.ini file, return dict with values or defaults.
@@ -173,6 +230,7 @@ def load_config() -> dict:
         "response_mode": DEFAULT_RESPONSE_MODE,
     }
     defaults.update(DEFAULT_TIER_VALUES)
+    defaults.update(DEFAULT_ADVISORY_VALUES)
 
     if not os.path.exists(CONFIG_PATH):
         return defaults
@@ -207,6 +265,16 @@ def load_config() -> dict:
         for key, fallback in DEFAULT_TIER_VALUES.items():
             value = config.getfloat("Settings", key, fallback=fallback)
             loaded[key] = value if value > 0 else fallback
+
+        # Same rule for the advisory numbers, and the on/off flag on top.
+        for key, fallback in DEFAULT_ADVISORY_VALUES.items():
+            if key == "advisories_enabled":
+                continue
+            value = config.getfloat("Settings", key, fallback=fallback)
+            loaded[key] = value if value > 0 else fallback
+        loaded["advisories_enabled"] = _config_bool(
+            config, ADVISORIES_CONFIG_KEY, DEFAULT_ADVISORIES_ENABLED
+        )
         return loaded
     except Exception:
         # If config is corrupted or missing section, return defaults
@@ -270,6 +338,20 @@ def set_tier_values(**kwargs) -> None:
             if key in TIER_VALUES:
                 TIER_VALUES[key] = float(value)
 
+def get_advisory_values() -> dict:
+    """Thread-safe snapshot of the advisory settings, including the on/off flag."""
+    with _config_lock:
+        return dict(ADVISORY_VALUES)
+
+def set_advisory_values(**kwargs) -> None:
+    """Thread-safe setter for advisory values. Unknown keys are ignored."""
+    with _config_lock:
+        for key, value in kwargs.items():
+            if key not in ADVISORY_VALUES:
+                continue
+            ADVISORY_VALUES[key] = (bool(value) if key == "advisories_enabled"
+                                    else float(value))
+
 def get_response_mode() -> str:
     """Thread-safe getter. Changed from the tray at runtime, read every tick."""
     with _config_lock:
@@ -298,6 +380,7 @@ def reset_config_to_defaults() -> bool:
 _config_data = load_config()
 set_config_values(_config_data["threshold_amps"], _config_data["sustained_seconds_required"])
 set_tier_values(**_config_data)
+set_advisory_values(**_config_data)
 set_response_mode(_config_data.get("response_mode", DEFAULT_RESPONSE_MODE))
 SENSOR_BACKEND = _config_data.get("sensor_backend", DEFAULT_SENSOR_BACKEND)
 
@@ -845,6 +928,170 @@ class FlightRecorder:
             pass
 
 
+class Advisory(NamedTuple):
+    """One thing the advisor wants said. The caller decides how to say it."""
+
+    # "dead_pin", "imbalance" or "cleared".
+    kind: str
+    # 1-based pin the advisory is about (the quiet one, or the busiest one).
+    pin: Optional[int]
+    # Full line for a log file or Event Viewer: numbers and what to do about them.
+    message: str
+    # One short line, for a toast.
+    summary: str
+    # Tooltip fragment, a few words. Empty for "cleared".
+    short: str
+    # True for the first warning of an episode, False for a repeat. A "cleared"
+    # advisory is not a warning, so it is never first.
+    first: bool
+
+
+class PinAdvisor:
+    """Warn-only reading of the per-pin spread. It never mitigates and never stops.
+
+    The tiers cannot see a fault that lowers every reading, and an open pin is
+    exactly that: the load moves to the pins that are left, and if the card is not
+    near its limit no single pin has to go over threshold for the connector to be in
+    trouble. This looks at the shape of the six readings rather than the biggest one.
+
+    Deliberately platform neutral: pure logic, no toast, no Event Viewer, no shared
+    state, no logger, no clock of its own (every decision uses the `now` handed in).
+    The caller renders whatever evaluate() returns, which is what lets the planned
+    Linux daemon import this class unchanged.
+    """
+
+    def __init__(self, values: Optional[dict] = None):
+        merged = dict(DEFAULT_ADVISORY_VALUES)
+        if values:
+            merged.update(values)
+        self.load_amps = float(merged["advisory_load_amps"])
+        self.dead_pin_max_amps = float(merged["dead_pin_max_amps"])
+        self.imbalance_spread_amps = float(merged["imbalance_spread_amps"])
+        self.sustain_seconds = float(merged["advisory_sustain_seconds"])
+        self.repeat_seconds = float(merged["advisory_repeat_seconds"])
+        self.reset()
+
+    def reset(self) -> None:
+        """Forget everything. Called whenever the caller's own timers reset.
+
+        A gap in the readings (sensor loss, suspend, a pause) means the half-formed
+        condition on the other side of it was never observed for as long as it looks.
+        """
+        # The condition seen on the last tick, and when its unbroken run started.
+        self._kind: Optional[str] = None
+        self._since: Optional[float] = None
+        # The episode already reported, if any, and when it was last reported.
+        self._episode: Optional[str] = None
+        self._episode_pin: Optional[int] = None
+        self._last_report = 0.0
+        # When the reported episode's condition went away, for the clear timer.
+        self._absent_since: Optional[float] = None
+
+    def evaluate(self, now: float, pins) -> List[Advisory]:
+        """One tick. Returns what should be said this time, usually nothing.
+
+        pins is the loop's [(label, amps, unit)] list.
+        """
+        out: List[Advisory] = []
+        kind, pin, message, summary, short = self._classify(pins)
+
+        if kind is None:
+            self._kind = None
+            self._since = None
+            if self._episode is not None:
+                if self._absent_since is None:
+                    self._absent_since = now
+                elif (now - self._absent_since) >= ADVISORY_CLEAR_SEC:
+                    out.append(self._close_episode())
+            return out
+
+        # A different fault than the one being reported is a new episode. The old one
+        # is over whether or not it had the full clear window to end quietly.
+        if self._episode is not None and self._episode != kind:
+            out.append(self._close_episode())
+
+        if kind != self._kind:
+            self._kind = kind
+            self._since = now
+        self._absent_since = None
+
+        if self._episode is None:
+            if (now - self._since) >= self.sustain_seconds:
+                self._episode = kind
+                self._episode_pin = pin
+                self._last_report = now
+                out.append(Advisory(kind, pin, message, summary, short, True))
+        elif self.repeat_seconds > 0 and (now - self._last_report) >= self.repeat_seconds:
+            self._episode_pin = pin
+            self._last_report = now
+            out.append(Advisory(kind, pin, message, summary, short, False))
+        return out
+
+    # ---- internals ----
+    def _close_episode(self) -> Advisory:
+        """End the reported episode and produce the one line that says so."""
+        name = "dead pin" if self._episode == "dead_pin" else "imbalance"
+        pin = self._episode_pin
+        where = f" on pin {pin}" if pin else ""
+        message = f"Pin advisory cleared: the {name} condition{where} is gone."
+        self._episode = None
+        self._episode_pin = None
+        self._last_report = 0.0
+        self._absent_since = None
+        return Advisory("cleared", pin, message, message, "", False)
+
+    def _classify(self, pins):
+        """(kind, pin, message, summary, short) for this sample, kind None if clean."""
+        nothing = (None, None, "", "", "")
+        try:
+            amps = [float(a) for _label, a, _unit in pins]
+        except Exception:
+            return nothing
+        if len(amps) < 2:
+            return nothing
+
+        # Idle noise is not a fault. Nothing can start below the load gate, and an
+        # episode that is running is treated as absent, which feeds its clear timer.
+        if sum(amps) < self.load_amps:
+            return nothing
+
+        # Dead pin first: it is the more specific fault, and a dead pin usually
+        # produces a large spread as well.
+        dead = [i for i, a in enumerate(amps) if a <= self.dead_pin_max_amps]
+        if dead:
+            low = min(dead, key=lambda i: amps[i])
+            others = [a for j, a in enumerate(amps) if j != low]
+            mean_others = sum(others) / len(others)
+            if mean_others >= DEAD_PIN_OTHERS_MIN_AMPS:
+                pin = low + 1
+                extra = f" ({len(dead)} pins read near zero)" if len(dead) > 1 else ""
+                summary = (f"Pin {pin} reads {amps[low]:.2f} A while the others average "
+                           f"{mean_others:.2f} A{extra}.")
+                message = (f"Pin advisory: pin {pin} reads {amps[low]:.2f} A while the "
+                           f"other {len(others)} average {mean_others:.2f} A{extra}. That "
+                           f"pin or its contact looks open, so the load is going through "
+                           f"the rest. Reseat the cable at both ends and check the "
+                           f"connector.")
+                return "dead_pin", pin, message, summary, f"pin {pin} near zero"
+
+        hi = max(range(len(amps)), key=lambda i: amps[i])
+        lo = min(range(len(amps)), key=lambda i: amps[i])
+        spread = amps[hi] - amps[lo]
+        if spread >= self.imbalance_spread_amps and amps[hi] >= IMBALANCE_MIN_MAX_AMPS:
+            pin = hi + 1
+            summary = (f"Pin {pin} carries {amps[hi]:.2f} A, pin {lo + 1} carries "
+                       f"{amps[lo]:.2f} A (spread {spread:.2f} A).")
+            message = (f"Pin advisory: pin {pin} carries {amps[hi]:.2f} A while pin "
+                       f"{lo + 1} carries {amps[lo]:.2f} A, a spread of {spread:.2f} A "
+                       f"across the connector. Uneven contact resistance puts the heat "
+                       f"on the busiest pin. Reseat the cable at both ends and check the "
+                       f"connector.")
+            return ("imbalance", pin, message, summary,
+                    f"pin {pin} high, spread {spread:.1f}A")
+
+        return nothing
+
+
 def candidate_backends(logger: logging.Logger) -> List[object]:
     """Backend classes to try, in order, for the configured sensor_backend setting."""
     if SENSOR_BACKEND == "hwinfo":
@@ -1354,6 +1601,9 @@ shared = {
     "source": "",
     # "" until we know, then "ready" or the reason the GPU cannot be limited.
     "mitigation": "",
+    # A few words about a live pin advisory, None when there is nothing to say.
+    # Advisories never change the icon: the guard has not acted on anything.
+    "advisory": None,
 }
 
 def set_state(**kwargs):
@@ -1409,6 +1659,17 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
         f"Tier 2 critical={tier_values['critical_amps']:.2f}A/{tier_values['critical_seconds']:.0f}s | "
         f"Tier 3 catastrophic={tier_values['catastrophic_amps']:.2f}A"
     )
+    advisory_values = get_advisory_values()
+    if advisory_values["advisories_enabled"]:
+        logger.info(
+            f"Advisories (warn only): load gate={advisory_values['advisory_load_amps']:.1f}A | "
+            f"dead pin<={advisory_values['dead_pin_max_amps']:.2f}A | "
+            f"spread>={advisory_values['imbalance_spread_amps']:.2f}A | "
+            f"sustain={advisory_values['advisory_sustain_seconds']:.0f}s | "
+            f"repeat={advisory_values['advisory_repeat_seconds']:.0f}s"
+        )
+    else:
+        logger.info("Advisories: off")
     toast("12VHPWR Guard", "Monitoring started.")
     if HAVE_EVENTLOG:
         eventlog_write(win32con.EVENTLOG_INFORMATION_TYPE, 1000, "12VHPWR Guard started.")
@@ -1437,6 +1698,7 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
     backend = None
     crosscheck = CrossCheck()
     flight = FlightRecorder()
+    advisor = PinAdvisor(advisory_values)
     backend_classes = candidate_backends(logger)
 
     # pause bookkeeping: a paused guard protects nothing, so it must not be
@@ -1476,6 +1738,33 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
         f"Sensor backend: setting={SENSOR_BACKEND}, "
         f"trying [{', '.join(c.key for c in backend_classes)}]"
     )
+
+    def render_advisory(adv: Advisory) -> None:
+        """Say one advisory out loud. Nothing here touches the GPU or the machine.
+
+        PinAdvisor stays platform neutral, so every Windows-specific part of an
+        advisory (toast, Event Viewer, tray tooltip) happens here instead.
+        """
+        if adv.kind == "cleared":
+            logger.info(adv.message)
+            if HAVE_EVENTLOG:
+                eventlog_write(win32con.EVENTLOG_INFORMATION_TYPE, 7004, adv.message)
+            set_state(advisory=None)
+            return
+
+        logger.warning(adv.message)
+        if HAVE_EVENTLOG:
+            eventlog_write(
+                win32con.EVENTLOG_WARNING_TYPE,
+                7002 if adv.kind == "dead_pin" else 7001,
+                adv.message,
+            )
+        set_state(advisory=adv.short)
+        toast("12VHPWR Guard - advisory", adv.summary)
+        if adv.first:
+            # The minute before the first warning is the evidence: it is what an RMA
+            # claim or a bug report needs, and the fault may not repeat on demand.
+            flight.dump(logger, "advisory")
 
     def try_connect() -> bool:
         """One pass over the candidate backends. True as soon as one connects."""
@@ -1569,6 +1858,10 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
                 if paused_since is None:
                     paused_since = now_paused
                     last_pause_reminder = now_paused
+                    # Nothing is being watched from here on, so a half-formed
+                    # advisory must not survive the pause either.
+                    advisor.reset()
+                    set_state(advisory=None)
                 if response.engaged:
                     # Pausing hands the decision back to the user. Leaving their GPU
                     # crippled while no longer watching it is not ours to do.
@@ -1603,6 +1896,7 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
                 last_over_notice = 0.0
                 pins_missing = False
                 last_sample_time = None
+                advisor.reset()
 
             try:
                 pins = backend.read_pins()
@@ -1620,6 +1914,7 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
                     clear_start = None
                     consecutive_over = 0
                     last_over_notice = 0.0
+                    advisor.reset()
                     # Readings right after a resume are not trustworthy, so anything
                     # decided on the strength of them is dropped too.
                     if response.engaged:
@@ -1650,6 +1945,12 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
 
                 crosscheck.maybe_log(logger, backend, pins)
                 flight.record(pins)
+
+                # Warn only, and completely separate from the threshold logic below:
+                # an advisory never engages the mitigator and never shuts down.
+                if get_advisory_values()["advisories_enabled"]:
+                    for adv in advisor.evaluate(sample_now, pins):
+                        render_advisory(adv)
 
                 max_label, max_val, max_unit = max(pins, key=lambda x: x[1])
                 set_state(max_label=max_label, max_val=max_val, max_unit=max_unit)
@@ -1783,6 +2084,10 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
                 toast("12VHPWR Guard", "Sensor source lost. Waiting to reconnect...")
                 if over_start is not None:
                     logger.warning("Sustained over-threshold timer reset by sensor disconnect.")
+                # The advisory timers go with it: a condition seen before a blind
+                # spell was not observed across it.
+                advisor.reset()
+                set_state(advisory=None)
                 if response.engaged:
                     # Deliberately stays engaged. We limited the card because the
                     # current was dangerous, and losing the ability to measure is not
@@ -2278,12 +2583,17 @@ def tray_title() -> str:
     source = st.get("source", "")
     src = f" | {source}" if source else ""
 
+    # Warn-only, so it rides along with whatever the status already is rather than
+    # replacing it.
+    advisory = st.get("advisory") or ""
+    adv = f" | advisory: {advisory}" if advisory else ""
+
     if paused:
         return "12VHPWR Guard (Paused)"
     if status == Status.MITIGATED:
-        return f"12VHPWR Guard: LIMITED | {max_label} {max_val:.2f}{max_unit}{src}"
+        return f"12VHPWR Guard: LIMITED | {max_label} {max_val:.2f}{max_unit}{src}{adv}"
     if status in (Status.OVER, Status.SHUTDOWN):
-        return f"12VHPWR Guard: {status} | {max_label} {max_val:.2f}{max_unit}{src}"
+        return f"12VHPWR Guard: {status} | {max_label} {max_val:.2f}{max_unit}{src}{adv}"
     if status == Status.MISSING:
         return "12VHPWR Guard: Sensors missing"
     if status == Status.ERROR:
@@ -2292,7 +2602,7 @@ def tray_title() -> str:
     # Protection must never weaken silently: if a tier crossing is going straight to
     # shutdown, the tooltip says so even when the setting says otherwise.
     mode = " | shutdown-only" if effective_shutdown_only() else ""
-    return f"12VHPWR Guard: OK | Max {max_val:.2f}{max_unit}{src}{mode}"
+    return f"12VHPWR Guard: OK | Max {max_val:.2f}{max_unit}{src}{adv}{mode}"
 
 def run_tray(stop_event: threading.Event):
     if not HAVE_TRAY:
