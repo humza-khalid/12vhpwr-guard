@@ -1433,11 +1433,16 @@ class TieredResponse:
                     f"persistent fault and shut the machine down.")
         if not restored:
             msg += " WARNING: the card may not be fully restored, check the log above."
+            if HAVE_EVENTLOG:
+                # The read-back detail (both numbers) when the mitigator has it.
+                eventlog_write(win32con.EVENTLOG_WARNING_TYPE, 6007,
+                               getattr(m, "last_restore_warning", None) or msg)
 
         self.log.warning(msg)
         if HAVE_EVENTLOG:
             eventlog_write(win32con.EVENTLOG_INFORMATION_TYPE, 6005, msg)
-        toast("12VHPWR Guard", "GPU restored to normal clocks and power limit.")
+        toast("12VHPWR Guard", "GPU restored to normal clocks and power limit." if restored
+              else "GPU limit released, but the restore could not be verified. Check the log.")
 
     def reset_timers(self) -> None:
         """Drop every in-flight timer. Used after a suspend/resume gap."""
