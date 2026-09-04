@@ -607,6 +607,18 @@ unset (the normal case) the guard reads the real `Global\HWiNFO_SENS_SM2` block.
 will shut the machine down for real. Raise `sustained_seconds_required` in `config.ini` while
 testing.
 
+### Running the tests
+
+```
+python -m pip install pytest
+python -m pytest -q tests
+```
+
+Windows only, since the guard imports `ctypes.wintypes`. The suite fakes the sensor and the
+GPU and stubs the shutdown, so it cannot power the machine off or touch the card, and it
+writes nothing outside a temporary directory. The rig end-to-end script is separate and is not
+in this repo: it drives the real NVML mitigation on a real Astral card and needs the hardware.
+
 ---
 
 ## Disclaimer & Legal Notice
