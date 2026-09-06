@@ -78,32 +78,48 @@ def write_pci_device(root, address, vendor, device, sub_vendor, sub_device, pci_
 
 
 class FakeIoctl:
-    """Stands in for the module's one ioctl call site and records what it was handed."""
+    """Stands in for the module's one ioctl call site and records what it was handed.
 
-    def __init__(self, payload_bytes=None, errno=None):
+    Emulates the kernel side of the two ioctls a read is made of. I2C_SLAVE records the address
+    the descriptor was bound to; I2C_SMBUS checks the request is a 24 byte block READ of
+    register 0x80, fills block[1..24] with the synthetic frame, and writes the produced count
+    back into block[0] the way the kernel does. Any other request is a test failure.
+    """
+
+    def __init__(self, payload_bytes=None, errno=None, funcs=None, produced=None):
         self.payload_bytes = payload_bytes
         self.errno = errno
-        self.calls = []          # every request
-        self.transactions = []   # I2C_RDWR only, decoded into plain tuples
+        self.funcs = poc.I2C_FUNC_SMBUS_READ_I2C_BLOCK if funcs is None else funcs
+        self.produced = produced     # override the count the kernel reports back
+        self.calls = []              # (fd, request) for every ioctl, in order
+        self.addresses = []          # every address selected with I2C_SLAVE
+        self.reads = []              # (read_write, command, size, requested) per I2C_SMBUS
 
     def __call__(self, fd, request, arg):
         self.calls.append((fd, request))
         if request == poc.I2C_FUNCS:
-            arg.value = poc.I2C_FUNC_I2C
+            arg.value = self.funcs
             return 0
-        if request != poc.I2C_RDWR:
+        if request == poc.I2C_SLAVE:
+            assert isinstance(arg, int), "I2C_SLAVE takes the plain 7 bit address"
+            self.addresses.append(arg)
+            return 0
+        if request != poc.I2C_SMBUS:
             raise AssertionError(f"unexpected ioctl request {request:#06x}")
         if self.errno is not None:
             raise OSError(self.errno, "fake failure")
 
-        messages = []
-        for i in range(arg.nmsgs):
-            msg = arg.msgs[i]
-            payload = bytes(msg.buf[j] for j in range(msg.len))
-            messages.append((msg.addr, msg.flags, msg.len, payload))
-            if msg.flags & poc.I2C_M_RD and self.payload_bytes is not None:
-                ctypes.memmove(msg.buf, self.payload_bytes, msg.len)
-        self.transactions.append(messages)
+        block = arg.data.contents.block
+        requested = block[0]
+        self.reads.append((arg.read_write, arg.command, arg.size, requested))
+        assert arg.read_write == poc.I2C_SMBUS_READ, "this tool may only ever read"
+        assert arg.command == poc.IT8915_REG_START
+        assert arg.size == poc.I2C_SMBUS_I2C_BLOCK_DATA
+        assert requested == poc.IT8915_DATA_SIZE
+        if self.payload_bytes is not None:
+            for offset, value in enumerate(self.payload_bytes[:requested]):
+                block[1 + offset] = value
+        block[0] = requested if self.produced is None else self.produced
         return 0
 
 
@@ -111,8 +127,12 @@ class FakeIoctl:
 def test_transaction_shape_holds_on_this_platform():
     poc.assert_transaction_shape()
     pointer_size = ctypes.sizeof(ctypes.c_void_p)
-    assert ctypes.sizeof(poc.I2cMsg) == 8 + pointer_size
-    assert poc.I2cRdwrIoctlData.nmsgs.offset == pointer_size
+    assert ctypes.sizeof(poc.I2cSmbusIoctlData) == 8 + pointer_size
+    assert poc.I2cSmbusIoctlData.read_write.offset == 0
+    assert poc.I2cSmbusIoctlData.command.offset == 1
+    assert poc.I2cSmbusIoctlData.size.offset == 4
+    assert poc.I2cSmbusIoctlData.data.offset == 8
+    assert ctypes.sizeof(poc.I2cSmbusData) == poc.I2C_SMBUS_BLOCK_MAX + 2
 
 
 def test_seven_bit_address_is_the_nvapi_address_unshifted():
@@ -245,7 +265,7 @@ PINS = [(11.900, 8.100), (11.910, 8.200), (11.920, 8.300),
         (11.930, 8.400), (11.940, 8.500), (11.950, 20.000)]
 
 
-def test_read_pin_block_issues_one_read_only_transaction(monkeypatch):
+def test_read_pin_block_issues_slave_then_one_block_read(monkeypatch):
     import astral_i2c
 
     block = build_block(PINS)
@@ -254,18 +274,12 @@ def test_read_pin_block_issues_one_read_only_transaction(monkeypatch):
 
     raw = poc.read_pin_block(fd=7)
 
-    # Exactly one ioctl, and it was the combined transaction.
-    assert len(fake.calls) == 1
-    assert fake.calls[0] == (7, poc.I2C_RDWR)
-    assert len(fake.transactions) == 1
-
-    messages = fake.transactions[0]
-    assert len(messages) == 2
-    write_addr, write_flags, write_len, write_payload = messages[0]
-    assert (write_addr, write_flags, write_len) == (0x2B, 0, 1)
-    assert write_payload == bytes([0x80])          # the register pointer, the only byte written
-    read_addr, read_flags, read_len, _ = messages[1]
-    assert (read_addr, read_flags, read_len) == (0x2B, poc.I2C_M_RD, 24)
+    # Exactly two ioctls, in order, on the caller's descriptor, and nothing else.
+    assert fake.calls == [(7, poc.I2C_SLAVE), (7, poc.I2C_SMBUS)]
+    assert fake.addresses == [0x2B]                # the 7 bit address, not the NVAPI 0x56
+    # Direction, register, transfer kind, requested length. The register pointer 0x80 is the
+    # only byte that leaves this program, and it leaves inside a read.
+    assert fake.reads == [(poc.I2C_SMBUS_READ, 0x80, poc.I2C_SMBUS_I2C_BLOCK_DATA, 24)]
 
     assert raw == block
     decoded = astral_i2c.parse_pin_block(raw)
@@ -273,6 +287,25 @@ def test_read_pin_block_issues_one_read_only_transaction(monkeypatch):
     for (pin, volts, amps), (want_v, want_a) in zip(decoded, PINS):
         assert volts == pytest.approx(want_v, abs=0.0005), f"pin{pin} volts"
         assert amps == pytest.approx(want_a, abs=0.0005), f"pin{pin} amps"
+
+
+def test_a_part_filled_block_is_refused_rather_than_decoded(monkeypatch):
+    """block[0] comes back as the count the kernel produced; a short one is a transport fault."""
+    fake = FakeIoctl(payload_bytes=build_block(PINS), produced=8)
+    monkeypatch.setattr(poc, "_ioctl", fake)
+
+    with pytest.raises(poc.AdapterError) as excinfo:
+        poc.read_pin_block(fd=3)
+    assert "8 bytes" in str(excinfo.value)
+
+
+def test_a_failing_block_read_surfaces_the_errno(monkeypatch):
+    fake = FakeIoctl(errno=5)          # EIO, what the six wrong adapters return
+    monkeypatch.setattr(poc, "_ioctl", fake)
+
+    with pytest.raises(OSError):
+        poc.read_pin_block(fd=3)
+    assert fake.calls == [(3, poc.I2C_SLAVE), (3, poc.I2C_SMBUS)]
 
 
 def test_pin_one_is_decoded_from_the_last_four_bytes():
@@ -287,31 +320,115 @@ def test_read_from_adapter_checks_functionality_then_reads(tmp_path, monkeypatch
     fake = FakeIoctl(payload_bytes=build_block(PINS))
     monkeypatch.setattr(poc, "_ioctl", fake)
 
-    raw = poc.read_from_adapter(str(node))
+    raw, note = poc.read_from_adapter(str(node))
 
-    assert [request for _fd, request in fake.calls] == [poc.I2C_FUNCS, poc.I2C_RDWR]
-    assert len(fake.transactions) == 1
+    assert [request for _fd, request in fake.calls] == [
+        poc.I2C_FUNCS, poc.I2C_SLAVE, poc.I2C_SMBUS
+    ]
+    assert fake.reads == [(poc.I2C_SMBUS_READ, 0x80, poc.I2C_SMBUS_I2C_BLOCK_DATA, 24)]
+    assert note is None
     assert raw == build_block(PINS)
 
 
-def test_smbus_only_adapter_is_rejected_before_any_transaction(tmp_path, monkeypatch):
+def test_adapter_without_the_block_read_bit_is_noted_not_skipped(tmp_path, monkeypatch):
+    """A missing functionality bit is a note. The closed NVIDIA driver is not a reliable oracle,
+    and the read is read-only whatever it advertises, so the tool tries anyway."""
     node = tmp_path / "i2c-0"
     node.write_text("")
+    fake = FakeIoctl(payload_bytes=build_block(PINS), funcs=0x00080000)   # some other bit
+    monkeypatch.setattr(poc, "_ioctl", fake)
 
-    def smbus_only(fd, request, arg):
-        assert request == poc.I2C_FUNCS, "no transaction may be attempted"
-        arg.value = 0x00080000      # some SMBus bit, no I2C_FUNC_I2C
-        return 0
+    raw, note = poc.read_from_adapter(str(node))
 
-    monkeypatch.setattr(poc, "_ioctl", smbus_only)
-    with pytest.raises(poc.AdapterError):
-        poc.read_from_adapter(str(node))
+    assert [request for _fd, request in fake.calls] == [
+        poc.I2C_FUNCS, poc.I2C_SLAVE, poc.I2C_SMBUS
+    ]
+    assert raw == build_block(PINS)
+    assert note is not None and "0x00080000" in note
+
+
+def test_functionality_note_is_silent_when_the_bit_is_advertised():
+    assert poc.functionality_note(poc.I2C_FUNC_SMBUS_READ_I2C_BLOCK | 0x1) is None
+    assert poc.functionality_note(None) is None          # the query itself failed
+    assert poc.functionality_note(0) is not None
 
 
 # ------------------------------------------------------ (d) plausibility gate
+# What the rig actually returned on 2026-09-05, from /dev/i2c-1 on a ROG Astral RTX 5090 OC,
+# through the repeated-START read that has since been removed. Not all zeros, so it slipped
+# past that check, and every pin decoded to about 0.000 A and 0.0 V.
+RIG_ZERO_FRAME = bytes.fromhex(
+    "00 00 00 00 00 00 00 00 00 01 00 00 00 00 00 01 00 00 00 01 00 30 00 00"
+)
+
+# A real idle frame, the first of the thirty astral-hwmon captured on the same model of card
+# (its first 24 bytes, the six pin blocks). About 12.17 V and half an amp per pin.
+IDLE_FRAME = bytes.fromhex(
+    "2f 90 01 f4 2f 88 02 1c 2f 88 01 e0 2f 90 01 f4 2f 88 01 f4 2f 90 01 e0"
+)
+
+
 def test_plausible_block_is_accepted():
     ok, reason = poc.block_verdict(build_block(PINS))
     assert ok, reason
+
+
+def test_the_rig_frame_from_the_removed_read_path_is_rejected():
+    assert len(RIG_ZERO_FRAME) == 24
+    assert any(RIG_ZERO_FRAME), "the point of this frame is that it is not all zeros"
+
+    ok, reason = poc.block_verdict(RIG_ZERO_FRAME)
+    assert not ok
+    assert "pin1" in reason, reason                  # the first pin out of range
+    assert "V=0.048" in reason, reason               # named with its values
+    assert "A=0.000" in reason, reason
+
+
+def test_the_rig_frame_would_have_passed_the_runtime_gate():
+    """Why this tool needs a tighter window than astral_i2c: 0 V is 'plausible' there."""
+    import astral_i2c
+
+    pins = astral_i2c.parse_pin_block(RIG_ZERO_FRAME)
+    assert all(astral_i2c.is_plausible(volts, amps) for _pin, volts, amps in pins)
+    assert not all(poc._pin_plausible(volts, amps) for _pin, volts, amps in pins)
+
+
+def test_a_real_idle_frame_is_accepted_and_decodes_to_twelve_volts():
+    import astral_i2c
+
+    assert len(IDLE_FRAME) == 24
+    ok, reason = poc.block_verdict(IDLE_FRAME)
+    assert ok, reason
+
+    for pin, volts, amps in astral_i2c.parse_pin_block(IDLE_FRAME):
+        assert 12.1 <= volts <= 12.2, f"pin{pin} volts {volts}"
+        assert 0.48 <= amps <= 0.54, f"pin{pin} amps {amps}"
+
+
+def test_a_sagging_pin_stays_visible_rather_than_being_rejected():
+    """The 6.0 V floor is loose on purpose: a failing connector lowers the pin voltage."""
+    pins = list(PINS)
+    pins[3] = (7.500, 9.000)
+    ok, reason = poc.block_verdict(build_block(pins))
+    assert ok, reason
+
+
+def test_a_pin_below_the_floor_is_rejected_by_voltage():
+    pins = list(PINS)
+    pins[4] = (5.000, 9.000)
+    ok, reason = poc.block_verdict(build_block(pins))
+    assert not ok
+    assert "pin5" in reason
+    assert "V=5.000" in reason
+
+
+def test_a_pin_above_the_ceiling_is_rejected_by_voltage():
+    pins = list(PINS)
+    pins[0] = (13.500, 9.000)
+    ok, reason = poc.block_verdict(build_block(pins))
+    assert not ok
+    assert "pin1" in reason
+    assert "V=13.500" in reason
 
 
 def test_all_ff_block_is_rejected():
@@ -392,10 +509,20 @@ def test_running_off_linux_exits_one():
 
 
 def test_no_write_path_exists_in_the_module():
-    """The read-only guarantee is structural: nothing here may put bytes on the bus."""
+    """The read-only guarantee is structural: nothing here may put bytes on the bus.
+
+    The two removed constants are on the banned list as well. The repeated-START path is what
+    silently returned zeros on this hardware, so it must not creep back in as a fallback.
+    """
     source = TOOL_PATH.read_text(encoding="utf-8")
-    assert sorted(re.findall(r"_ioctl\(fd, (\w+)", source)) == ["I2C_FUNCS", "I2C_RDWR"]
+    assert sorted(re.findall(r"_ioctl\(fd, (\w+)", source)) == [
+        "I2C_FUNCS", "I2C_SLAVE", "I2C_SMBUS"
+    ]
     assert re.findall(r"os\.open\([^)]*?,\s*(os\.\w+)", source) == ["os.O_RDONLY"] * 2
-    for banned in ("os.write", "I2C_SMBUS", "write_byte", "write_block", "O_WRONLY", "O_RDWR"):
+    for banned in ("os.write", "O_WRONLY", "O_RDWR", "I2C_SMBUS_WRITE",
+                   "write_byte", "write_block", "I2C_RDWR", "I2C_M_RD"):
         assert banned not in source, f"{banned} must not appear in a read-only tool"
-    assert "I2C_M_RD" in source
+
+    directions = re.findall(r"read_write\s*=\s*(\w+)", source)
+    assert directions, "the transaction must state its direction explicitly"
+    assert set(directions) == {"I2C_SMBUS_READ"}, directions

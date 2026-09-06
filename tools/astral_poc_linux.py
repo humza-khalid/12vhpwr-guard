@@ -12,14 +12,29 @@ Run it:
     sudo python3 tools/astral_poc_linux.py                    # one line per second until Ctrl-C
     sudo python3 tools/astral_poc_linux.py --once             # a single sample
     sudo python3 tools/astral_poc_linux.py --list             # candidate adapters, then exit
-    sudo python3 tools/astral_poc_linux.py --adapter 4 --raw --volts
+    sudo python3 tools/astral_poc_linux.py --adapter 1 --raw --volts
 
 READ-ONLY, with no exception. The only byte this program ever puts on the I2C bus is the single
-register pointer 0x80, sent as message 1 of one combined I2C_RDWR transaction whose message 2 is
-a 24 byte read from the same address. There is no other write path in this file: no SMBus write
-helper, no generic "write bytes" function, and no option that can change the register or the
+register pointer 0x80, and it goes out inside a read: read_write is always I2C_SMBUS_READ, on
+the one transaction this file performs. There is no write path here at all: no SMBus write
+helper, no generic "put bytes" function, and no option that can change the register or the
 device address. Writing to the wrong device on a GPU I2C bus can permanently damage hardware.
-The character device is opened O_RDONLY as well, so the descriptor itself cannot be written.
+The character device is opened O_RDONLY as well; i2c-dev does not gate its ioctl handlers on the
+file mode, so read-only is enough to read and is one less way to write.
+
+The transaction is the SMBus "I2C block data" read (the I2C_SMBUS ioctl with size
+I2C_SMBUS_I2C_BLOCK_DATA), and that is not a style choice. On the NVIDIA i2c adapters a plain
+repeated-START multi-byte read, a one byte write message followed by a read message in a single
+combined transfer, returns all zeros silently: the ioctl succeeds, the chip is never really
+spoken to, and the buffer decodes to a perfectly healthy 0.000 A on every pin. Measured by the
+ksokolowski/astral-hwmon project on 2026-08-13 (their driver and their independent userspace
+oracle both say so in as many words), and reproduced here on 2026-09-05 on a ROG Astral RTX 5090
+OC under Linux Mint. That path is not kept anywhere in this file, not even as a fallback: a
+silent wrong answer about pin currents is worse than no answer.
+
+astral-hwmon also established which adapter to expect. Of the card's seven adapters only
+"NVIDIA i2c adapter 1" answers at 0x2B; the other six return -EIO. All candidates are still
+tried, because trying costs nothing and proves the negative.
 
 Protocol constants (chip address, register, block layout, the supported card allowlist) live in
 astral_i2c.py at the repo root and are imported from there rather than restated, so the Windows
@@ -60,10 +75,18 @@ IT8915_DATA_SIZE = astral_i2c.IT8915_DATA_SIZE      # 24
 # ------------------------------------------------------------- linux i2c-dev ABI
 # From include/uapi/linux/i2c-dev.h and include/uapi/linux/i2c.h. These are plain ioctl numbers,
 # not _IO() encoded ones.
-I2C_FUNCS = 0x0705
-I2C_RDWR = 0x0707
-I2C_M_RD = 0x0001           # the only i2c_msg flag used here
-I2C_FUNC_I2C = 0x00000001   # adapter can do plain (non SMBus) transactions
+I2C_SLAVE = 0x0703                  # bind this descriptor to one chip address. No bus traffic.
+I2C_FUNCS = 0x0705                  # ask the driver what it can do. No bus traffic.
+I2C_SMBUS = 0x0720                  # perform one SMBus style transfer
+
+I2C_SMBUS_READ = 1                  # the only direction this file ever asks for
+I2C_SMBUS_I2C_BLOCK_DATA = 8        # "read N bytes from register R", N chosen by the caller
+I2C_SMBUS_BLOCK_MAX = 32            # union i2c_smbus_data's block[] is this + 2 bytes long
+
+# The functionality bit for that transfer. I2C_FUNC_I2C (0x00000001, plain non SMBus transfers)
+# is deliberately not checked any more: that is the family the zero-returning read belongs to,
+# so an adapter advertising it tells us nothing we want to act on.
+I2C_FUNC_SMBUS_READ_I2C_BLOCK = 0x04000000
 
 PCI_DEVICES_ROOT = "/sys/bus/pci/devices"
 I2C_DEVICES_ROOT = "/sys/bus/i2c/devices"
@@ -79,21 +102,22 @@ _ADAPTER_DIR_RE = re.compile(r"^i2c-(\d+)$")
 _ADAPTER_NAME_PORT_RE = re.compile(r"adapter\s+(\d+)", re.IGNORECASE)
 
 
-class I2cMsg(ctypes.Structure):
-    """struct i2c_msg. addr is the 7 bit address; the kernel shifts it onto the wire."""
+class I2cSmbusData(ctypes.Union):
+    """union i2c_smbus_data. Only block[] is used here: block[0] is the count, block[1:] data."""
     _fields_ = [
-        ("addr", ctypes.c_uint16),                  # 0
-        ("flags", ctypes.c_uint16),                 # 2
-        ("len", ctypes.c_uint16),                   # 4  (+2 pad)
-        ("buf", ctypes.POINTER(ctypes.c_uint8)),    # 8
+        ("byte", ctypes.c_uint8),
+        ("word", ctypes.c_uint16),
+        ("block", ctypes.c_uint8 * (I2C_SMBUS_BLOCK_MAX + 2)),
     ]
 
 
-class I2cRdwrIoctlData(ctypes.Structure):
-    """struct i2c_rdwr_ioctl_data: a pointer to the message array plus the message count."""
+class I2cSmbusIoctlData(ctypes.Structure):
+    """struct i2c_smbus_ioctl_data: direction, register, transfer kind, and the data buffer."""
     _fields_ = [
-        ("msgs", ctypes.POINTER(I2cMsg)),           # 0
-        ("nmsgs", ctypes.c_uint32),                 # sizeof(void *)
+        ("read_write", ctypes.c_uint8),             # 0
+        ("command", ctypes.c_uint8),                # 1  (+2 pad)
+        ("size", ctypes.c_uint32),                  # 4
+        ("data", ctypes.POINTER(I2cSmbusData)),     # 8
     ]
 
 
@@ -104,18 +128,19 @@ class AdapterError(RuntimeError):
 def assert_transaction_shape() -> None:
     """A wrong struct layout would put a malformed request on the bus. Fail before that.
 
-    Also re-checks the two constants shared with astral_i2c, so a change there cannot silently
-    leave this file pointing at a different chip or register.
+    Also re-checks the constants shared with astral_i2c, so a change there cannot silently
+    leave this file pointing at a different chip or register, or asking for more bytes than one
+    SMBus block can carry.
     """
     ptr = ctypes.sizeof(ctypes.c_void_p)
     checks = [
-        ("I2cMsg.addr", I2cMsg.addr.offset, 0),
-        ("I2cMsg.flags", I2cMsg.flags.offset, 2),
-        ("I2cMsg.len", I2cMsg.len.offset, 4),
-        ("I2cMsg.buf", I2cMsg.buf.offset, 8),
-        ("sizeof(I2cMsg)", ctypes.sizeof(I2cMsg), 8 + ptr),
-        ("I2cRdwrIoctlData.msgs", I2cRdwrIoctlData.msgs.offset, 0),
-        ("I2cRdwrIoctlData.nmsgs", I2cRdwrIoctlData.nmsgs.offset, ptr),
+        ("I2cSmbusIoctlData.read_write", I2cSmbusIoctlData.read_write.offset, 0),
+        ("I2cSmbusIoctlData.command", I2cSmbusIoctlData.command.offset, 1),
+        ("I2cSmbusIoctlData.size", I2cSmbusIoctlData.size.offset, 4),
+        ("I2cSmbusIoctlData.data", I2cSmbusIoctlData.data.offset, 8),
+        ("sizeof(I2cSmbusIoctlData)", ctypes.sizeof(I2cSmbusIoctlData), 8 + ptr),
+        ("I2cSmbusData.block", I2cSmbusData.block.offset, 0),
+        ("sizeof(I2cSmbusData)", ctypes.sizeof(I2cSmbusData), I2C_SMBUS_BLOCK_MAX + 2),
     ]
     for name, actual, expected in checks:
         if actual != expected:
@@ -131,6 +156,11 @@ def assert_transaction_shape() -> None:
             f"unexpected register/length {IT8915_REG_START:#04x}/{IT8915_DATA_SIZE}"
             " - refusing to touch I2C"
         )
+    if not 0 < IT8915_DATA_SIZE <= I2C_SMBUS_BLOCK_MAX:
+        raise RuntimeError(
+            f"{IT8915_DATA_SIZE} bytes does not fit in one SMBus block"
+            " - refusing to touch I2C"
+        )
 
 
 def _ioctl(fd: int, request: int, arg):
@@ -144,30 +174,38 @@ def _ioctl(fd: int, request: int, arg):
 
 
 def read_pin_block(fd: int) -> bytes:
-    """One combined read transaction against the IT8915. The only bus access in this file.
+    """One SMBus "I2C block data" read from the IT8915. The only bus access in this file.
 
-    Message 1: write the single register pointer byte 0x80 to 0x2B (1 byte, no flags).
-    Message 2: read 24 bytes from 0x2B (I2C_M_RD), with a repeated start, no stop in between.
-    Nothing else is ever written.
+    Two ioctls, in this order, and nothing else:
+      I2C_SLAVE  bind the descriptor to the 7 bit address 0x2B. Nothing reaches the bus.
+      I2C_SMBUS  read_write=I2C_SMBUS_READ, command=0x80 (the register pointer, and the only
+                 byte that goes out), size=I2C_SMBUS_I2C_BLOCK_DATA, data -> a union whose
+                 block[0] is 24 on the way in. On return block[0] holds the count the kernel
+                 produced and block[1..24] the bytes.
+
+    block[0] is in/out, so the returned count is checked rather than assumed: a part filled
+    buffer would otherwise decode trailing bytes left behind by whatever ran before.
     """
-    reg = (ctypes.c_uint8 * 1)(IT8915_REG_START)
-    data = (ctypes.c_uint8 * IT8915_DATA_SIZE)()
+    data = I2cSmbusData()
+    data.block[0] = IT8915_DATA_SIZE
+    payload = I2cSmbusIoctlData(
+        read_write=I2C_SMBUS_READ,
+        command=IT8915_REG_START,
+        size=I2C_SMBUS_I2C_BLOCK_DATA,
+        data=ctypes.pointer(data),
+    )
 
-    msgs = (I2cMsg * 2)()
-    msgs[0].addr = IT8915_ADDR_7BIT
-    msgs[0].flags = 0                       # write, and the only byte is the register pointer
-    msgs[0].len = 1
-    msgs[0].buf = ctypes.cast(reg, ctypes.POINTER(ctypes.c_uint8))
-    msgs[1].addr = IT8915_ADDR_7BIT
-    msgs[1].flags = I2C_M_RD
-    msgs[1].len = IT8915_DATA_SIZE
-    msgs[1].buf = ctypes.cast(data, ctypes.POINTER(ctypes.c_uint8))
-
-    payload = I2cRdwrIoctlData(msgs=ctypes.cast(msgs, ctypes.POINTER(I2cMsg)), nmsgs=2)
-    _ioctl(fd, I2C_RDWR, payload)
-    # reg/data/msgs stay referenced by this frame until here, so the kernel never sees freed
-    # memory behind those pointers.
-    return bytes(data)
+    _ioctl(fd, I2C_SLAVE, IT8915_ADDR_7BIT)
+    _ioctl(fd, I2C_SMBUS, payload)
+    # data stays referenced by this frame until here, so the kernel never sees freed memory
+    # behind payload.data.
+    produced = data.block[0]
+    if produced != IT8915_DATA_SIZE:
+        raise AdapterError(
+            f"block read at {IT8915_REG_START:#04x} produced {produced} bytes,"
+            f" expected {IT8915_DATA_SIZE}"
+        )
+    return bytes(data.block[1:IT8915_DATA_SIZE + 1])
 
 
 def adapter_functionality(fd: int) -> Optional[int]:
@@ -180,16 +218,31 @@ def adapter_functionality(fd: int) -> Optional[int]:
     return buf.value
 
 
-def read_from_adapter(dev_path: str) -> bytes:
-    """Open one adapter read-only, take a single sample, close it again."""
+def functionality_note(funcs: Optional[int]) -> Optional[str]:
+    """A note when the driver does not advertise block reads, or None when it does.
+
+    A note, not a refusal, and that is a considered choice. The NVIDIA adapters come from a
+    closed driver whose advertised bits are not a promise in either direction; the transfer is
+    read-only whatever they say; and an adapter that genuinely cannot do it fails the I2C_SMBUS
+    ioctl with an errno that the caller already handles and prints. Refusing on a missing bit
+    would only let the tool talk itself out of the one transfer known to work on this hardware.
+    """
+    if funcs is None or funcs & I2C_FUNC_SMBUS_READ_I2C_BLOCK:
+        return None
+    return (f"driver does not advertise SMBus block reads (funcs {funcs:#010x}),"
+            " trying anyway since the read is read-only either way")
+
+
+def read_from_adapter(dev_path: str) -> Tuple[bytes, Optional[str]]:
+    """Open one adapter read-only, take a single sample, close it again.
+
+    Returns the raw bytes plus a note about the driver's advertised functionality (None when
+    there is nothing to say), so the caller decides how to show it.
+    """
     fd = os.open(dev_path, os.O_RDONLY)
     try:
-        funcs = adapter_functionality(fd)
-        if funcs is not None and not funcs & I2C_FUNC_I2C:
-            raise AdapterError(
-                f"adapter reports no plain I2C support (funcs {funcs:#010x}), SMBus only"
-            )
-        return read_pin_block(fd)
+        note = functionality_note(adapter_functionality(fd))
+        return read_pin_block(fd), note
     finally:
         os.close(fd)
 
@@ -360,15 +413,37 @@ def find_gpu_i2c_adapters(
 
 
 # ------------------------------------------------------------------- decoding
+# This tool's own plausibility window, deliberately tighter than astral_i2c.is_plausible (which
+# allows 0 to 16 V), because the question here is "is this the monitor chip answering at all",
+# not "is this sample safe to act on". A device that is not the chip reads 0 V, and 0 V clears
+# the runtime gate as a perfectly healthy 0.000 A on every pin: that is exactly how the first
+# Mint run accepted a frame of near-zeros as real data.
+#
+# The floor is 6.0 V rather than something tight like 11.0 on purpose. A failing 12VHPWR
+# connector raises contact resistance and so lowers the pin voltage under load, which means a
+# tight floor would blind this tool to the very failure it exists to reveal. astral-hwmon
+# measured 11.944 V on the lowest pin under a 562 W burn, so half of nominal still rejects
+# garbage while leaving a sagging pin visible as a low number rather than as silence.
+PROBE_MIN_VOLTS = 6.0
+PROBE_MAX_VOLTS = 13.0
+PROBE_MAX_AMPS = 30.0
+
+
 def hex_dump(raw: bytes) -> str:
     return " ".join(f"{b:02X}" for b in raw)
+
+
+def _pin_plausible(volts: float, amps: float) -> bool:
+    return (PROBE_MIN_VOLTS <= volts <= PROBE_MAX_VOLTS) and (0.0 <= amps <= PROBE_MAX_AMPS)
 
 
 def block_verdict(raw: bytes) -> Tuple[bool, str]:
     """Is this 24 byte block a believable sample? Returns (ok, reason).
 
     An adapter that is not the monitor chip typically answers all 0xFF (nothing acked, bus
-    pulled high) or all 0x00, and either would decode into something that looks like data.
+    pulled high) or all 0x00, and either would decode into something that looks like data. A
+    frame that is neither, yet still reads near 0 V on a pin, is the same lie in better clothes,
+    so every pin is range checked and the first bad one is named with its values.
     """
     if len(raw) != IT8915_DATA_SIZE:
         return False, f"{len(raw)} bytes, expected {IT8915_DATA_SIZE}"
@@ -381,8 +456,12 @@ def block_verdict(raw: bytes) -> Tuple[bool, str]:
     except ValueError as ex:
         return False, str(ex)
     for pin, volts, amps in pins:
-        if not astral_i2c.is_plausible(volts, amps):
-            return False, f"pin{pin} implausible (V={volts:.3f} A={amps:.3f})"
+        if not _pin_plausible(volts, amps):
+            return False, (
+                f"pin{pin} implausible (V={volts:.3f} A={amps:.3f}), need"
+                f" {PROBE_MIN_VOLTS:.1f} to {PROBE_MAX_VOLTS:.1f} V and 0 to"
+                f" {PROBE_MAX_AMPS:.0f} A on every pin"
+            )
     return True, "plausible"
 
 
@@ -396,7 +475,9 @@ def format_sample(pins: List[Tuple[int, float, float]], show_volts: bool) -> str
     parts.append(f" total {sum(amps):6.3f} A")
     parts.append(f" max pin{max_pin} {max_amps:.3f} A")
     line = " ".join(parts)
-    if not all(astral_i2c.is_plausible(v, a) for _pin, v, a in pins):
+    # The same window block_verdict used to accept the adapter, so a stream that quietly
+    # degrades to zeros is tagged rather than printed as a healthy looking 0.000 A.
+    if not all(_pin_plausible(v, a) for _pin, v, a in pins):
         line += "   IMPLAUSIBLE"
     return line
 
@@ -465,10 +546,12 @@ def probe_adapters(adapters: List[Adapter]) -> Tuple[Optional[Adapter], Optional
     for adapter in adapters:
         label = f"  {adapter.dev_path} ({adapter.name or 'no name'})"
         try:
-            raw = read_from_adapter(adapter.dev_path)
+            raw, note = read_from_adapter(adapter.dev_path)
         except (OSError, AdapterError) as ex:
             print(f"{label}: {ex}", flush=True)
             continue
+        if note:
+            print(f"{label}: note: {note}", flush=True)
         ok, reason = block_verdict(raw)
         print(f"{label}: {reason}", flush=True)
         if not ok:
@@ -575,16 +658,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         adapters = [forced]
     elif not adapters:
         print(f"\nNo I2C adapter could be tied to {target.address}.")
-        print("The NVIDIA driver names its adapters 'NVIDIA i2c adapter N at ...'. If none of")
-        print("these look like the GPU, try one by hand with --adapter N (still read-only).")
+        print("The NVIDIA driver names its adapters 'NVIDIA i2c adapter N at ...', and the")
+        print("monitor chip sits behind adapter 1. If none of these look like the GPU, try one")
+        print("by hand with --adapter N (still read-only).")
         print("\nEvery I2C adapter on this machine:")
         describe_all_adapters()
         return 3
 
-    print("\nProbing adapters (read-only, register 0x80, 24 bytes):")
+    print("\nProbing adapters (read-only SMBus block read, register 0x80, 24 bytes):")
     adapter, _first_sample, saw_zeros = probe_adapters(adapters)
     if adapter is None:
         print("\nNo adapter returned plausible per-pin data.")
+        print("Only 'NVIDIA i2c adapter 1' is expected to carry the IT8915. On this card the")
+        print("other adapters do not answer at 0x2B at all, so a plausible frame from one of")
+        print("them would be a surprise worth reporting rather than a result to trust.")
         if saw_zeros:
             print("One adapter answered all zeros. On a BTF board the card draws through the")
             print("GC-HPWR slot connector and the card-side sensors carry no load, which reads")
@@ -602,7 +689,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         while True:
             try:
                 raw = read_pin_block(fd)
-            except OSError as ex:
+            except (OSError, AdapterError) as ex:
                 failures += 1
                 print(f"read failed: {ex}", flush=True)
                 if args.once or failures >= astral_i2c.ASTRAL_MAX_CONSECUTIVE_FAILURES:
