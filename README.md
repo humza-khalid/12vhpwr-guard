@@ -104,7 +104,8 @@ No other GPU exposes per-pin current, including non-Astral RTX 5080/5090 cards. 
 hardware the guard cannot protect anything and will say so rather than pretend to work.
 
 ### OS
-- Windows 10 / 11
+- Windows 10 / 11 for the guard itself. On Linux only a read-only sensor proof of concept
+  exists so far, see [Reading the card on Linux](#reading-the-card-on-linux-toolsastral_poc_linuxpy).
 
 ### Software
 - Python 3.10+
@@ -726,6 +727,33 @@ python tools/astral_poc.py --crosscheck    # 60s agreement check vs HWiNFO
 The protocol (chip address, register layout, pin ordering, NVAPI struct) is documented in the
 header of `astral_i2c.py`, with the two independent sources it was verified against. All access
 is **read-only**; the module deliberately does not bind NVAPI's I2C write function.
+
+### Reading the card on Linux (`tools/astral_poc_linux.py`)
+
+The guard itself is Windows only, but the sensor path is not. This read-only proof of
+concept reads the same IT8915 block over the kernel's `/dev/i2c-N` interface, no NVAPI and
+no HWiNFO, and prints the six pins once a second. It finds the card through sysfs, checks
+the subsystem id against the same allowlist, and probes only the GPU's own I2C adapters.
+
+```
+sudo modprobe i2c-dev
+python3 tools/astral_poc_linux.py --list                      # candidate adapters, no root needed
+sudo python3 tools/astral_poc_linux.py --once --raw --volts   # one sample plus the raw bytes
+sudo python3 tools/astral_poc_linux.py                        # 1 Hz table, Ctrl-C to stop
+```
+
+Verified 2026-09-07 on Linux Mint (kernel 7.0, driver 610.43) with a ROG Astral RTX 5090 OC:
+the chip answers on "NVIDIA i2c adapter 1" at address 0x2B and reads about 11.95 V and 0.5 to
+0.6 A per pin at idle, the same numbers Windows shows. One quirk worth knowing if you write
+your own reader: on the NVIDIA adapters a plain write-then-read transaction returns all zeros
+silently, while the SMBus "I2C block data" read works, which is what the tool uses. That
+finding comes from the astral-hwmon project, which reads the same chip from a kernel driver.
+Do not scan the GPU bus with `i2cdetect -y`; its default probe writes to every address.
+
+The tool guards nothing on its own. A Linux daemon built on this path is planned; until then
+astral-hwmon offers a hwmon driver with a report-only guard and a poweroff service example.
+All access here is **read-only**: the register pointer is the only byte the tool ever puts on
+the bus, the device is opened read-only, and a test bans every write path.
 
 ### Testing the GPU slowdown (`tools/mitigation_poc.py`)
 
