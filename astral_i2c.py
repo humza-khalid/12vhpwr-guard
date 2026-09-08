@@ -76,7 +76,8 @@ ASTRAL_SUBSYSTEM_IDS = {
     # the OpenRGB registry lists 0x8A3C and 0x8A5A side by side for this exact SKU.
     # The BTF board caveat above applies to this id as well.
     0x8A3C1043: "ROG Astral RTX 5090 BTF OC",
-    # Id from the owner's nvidia-smi in issue #6 + OpenRGB registry (RTX_5080_16G_GAMING).
+    # Field-verified in issue #6: owner's nvidia-smi id, then green with live amp readings
+    # under load on v1.3.1. OpenRGB lists it as ASTRAL_RTX_5080_16G_GAMING.
     0x89DF1043: "ROG Astral RTX 5080 (non-OC)",
 }
 
