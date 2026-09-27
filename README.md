@@ -54,7 +54,7 @@ This tool adds a last-line, OS-level safety net by:
 - Quiet rotating file logs
 - **Detects sensor loss** (HWiNFO exit/crash/freeze, or I2C failure) and auto-reconnects; never reports OK on stale data
 - **Resets its timer across sleep/resume** instead of trusting a stale reading
-- **Single-instance guard** (a second copy exits instead of double-monitoring)
+- **Single-instance guard** (one guard per PC, even with several Windows accounts signed in; a second copy exits instead of double-monitoring)
 - Uses **Task Scheduler as watchdog**
 
 ---
@@ -299,16 +299,58 @@ The easiest way to install 12VHPWR Guard is using the included installer.
    - Create a default `config.ini` if none exists
    - Create a `logs` folder
    - Register the **"12VHPWR Guard"** Event Viewer source (if permitted)
+   - Lock down the folder so only administrators can change the code (see
+     [Multiple Windows accounts](#multiple-windows-accounts))
    - Create a **scheduled task** named **"12VHPWR Guard"** that:
-     - Runs at user logon
+     - Runs at logon of your account, or of every account if you answer `y` to the
+       all-accounts question
      - Starts the guard with `pythonw.exe` (no console window)
      - Restarts automatically on failure (up to 999 times, 1-minute interval)
      - Runs indefinitely: the default 72-hour Task Scheduler execution limit is disabled,
        and battery-power settings will not stop it
 
-4. When asked **"Start 12VHPWR Guard now? (y/N)"**, type `y` and Enter to start immediately, or `N` to have it start at next logon.
+4. When asked **"Start 12VHPWR Guard for every Windows account on this PC?"**, answer `N`
+   (the default) if only you use this PC, or `y` if other people log on to it as well. See
+   [Multiple Windows accounts](#multiple-windows-accounts).
+
+5. When asked **"Start 12VHPWR Guard now? (y/N)"**, type `y` and Enter to start immediately, or `N` to have it start at next logon.
 
 **After installation:** The guard runs from the system tray. You'll see the 12VHPWR Guard icon when it's active. On a supported Astral card nothing else is needed; hover the icon and the tooltip should read `... | direct`. Only if you use the `hwinfo` backend does **HWiNFO64** need to be running with **Shared Memory Support** and the per-pin sensors enabled.
+
+### Multiple Windows accounts
+
+By default the guard starts only when the account that ran the installer logs on. If other
+people use the PC with their own Windows accounts, answer `y` to **"Start 12VHPWR Guard for
+every Windows account on this PC?"**. The task is then registered for the built-in Users
+group, so it starts for whoever logs on, in their own session, with the tray icon on their
+desktop.
+
+Before it does that, the installer checks two things that would otherwise stop it working
+for the other accounts:
+
+- **The folder is not inside a user profile.** Other accounts cannot read `C:\Users\<you>\...`
+  (Desktop, Downloads and so on). Put it somewhere like `C:\12vhpwr_guard`.
+- **Python is installed for all users.** The python.org "Install Now" button installs Python
+  inside your own profile, where other accounts cannot run it. Reinstall with *Customize
+  installation* and tick *Install Python for all users*, delete the `venv` folder, and run the
+  installer again.
+
+What the other accounts get depends on their account type:
+
+- **Administrator accounts** get the full guard, including the GPU clock and power limit.
+- **Standard accounts** get monitoring, the tray icon, warnings and the emergency shutdown,
+  but not the GPU clock and power limit, because Windows only lets administrators change
+  those.
+
+Only one guard runs per PC. If a second person logs on while the first is still signed in
+(switch user), the first person's guard keeps protecting the card in the background and the
+second person sees no tray icon. If the first person then signs out, the guard starts again
+at the next logon.
+
+The installer also removes write access to the program folder for everyone except
+administrators, in both modes. The guard runs with administrator rights, so anyone who can
+edit its files could get their own code run as administrator. Standard accounts can still
+write the logs and `config.ini`, which is all the guard needs from them.
 
 ---
 

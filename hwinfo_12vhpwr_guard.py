@@ -141,13 +141,16 @@ PAUSE_REMINDER_EVERY_SEC = 1800.0
 
 # Shown in the tray menu and logged at startup so "which version are you running"
 # is answerable without digging through files.
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.3.2"
 
 # Event Viewer source name
 EVENT_SOURCE = "12VHPWR Guard"
 
 # Single instance
-SINGLE_INSTANCE_MUTEX = r"Local\12VHPWR_Guard_SingleInstance"
+# Global, not Local: there is one GPU per machine, so two Windows accounts signed in
+# at once must not each run a guard that applies and restores the same GPU limit.
+SINGLE_INSTANCE_MUTEX = r"Global\12VHPWR_Guard_SingleInstance"
+ERROR_ACCESS_DENIED = 5
 ERROR_ALREADY_EXISTS = 183
 
 # =========================
@@ -2033,7 +2036,10 @@ def acquire_single_instance() -> bool:
     global _single_instance_handle
     ctypes.set_last_error(0)
     _single_instance_handle = CreateMutexW(None, False, SINGLE_INSTANCE_MUTEX)
-    return ctypes.get_last_error() != ERROR_ALREADY_EXISTS
+    err = ctypes.get_last_error()
+    # A mutex created by an elevated guard under another account cannot be opened by
+    # a standard user: that is ACCESS_DENIED with no handle, and it still means held.
+    return bool(_single_instance_handle) and err not in (ERROR_ALREADY_EXISTS, ERROR_ACCESS_DENIED)
 
 def confirm_unsafe_value(kind: str, new_value: float, default_value: float, unit: str) -> bool:
     """Values at or below the default need no warning; above it, protection is reduced."""
@@ -2311,7 +2317,7 @@ def main():
 
     # Two guards would mean two tray icons and two shutdown commands.
     if not acquire_single_instance():
-        toast("12VHPWR Guard", "Already running.")
+        toast("12VHPWR Guard", "Already running on this PC (possibly under another Windows account).")
         sys.exit(0)
 
     logger = setup_logger()
