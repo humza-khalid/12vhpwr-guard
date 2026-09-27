@@ -115,13 +115,12 @@ try {
 # logs on, so no other account may be able to change it. Folders directly under C:\
 # inherit Modify for every signed-in user, and Python also imports from the script's
 # own folder, so inheritance is cut and only Administrators and SYSTEM may write.
-# The installing account keeps Modify so a hand-started, non-elevated guard can still
-# log. In all-users mode, standard accounts get write access to logs and config.ini
-# only, which is all a guard without admin rights ever writes.
-$Grants = @("*${SidSystem}:(OI)(CI)F", "*${SidAdmins}:(OI)(CI)F", "*${SidUsers}:(OI)(CI)RX")
-if (-not $AllUsers) {
-    $Grants += "*$([Security.Principal.WindowsIdentity]::GetCurrent().User.Value):(OI)(CI)M"
-}
+# The installing account (an administrator, or this script would have stopped) keeps
+# Modify in both modes, so it can upgrade with git pull or by extracting a release
+# without an elevated window. In all-users mode, standard accounts get write access to
+# logs and config.ini only, which is all a guard without admin rights ever writes.
+$Grants = @("*${SidSystem}:(OI)(CI)F", "*${SidAdmins}:(OI)(CI)F", "*${SidUsers}:(OI)(CI)RX",
+    "*$([Security.Principal.WindowsIdentity]::GetCurrent().User.Value):(OI)(CI)M")
 & icacls $BaseDir /inheritance:r /grant:r @Grants /Q | Out-Null
 if ($LASTEXITCODE -ne 0) { Write-Warn "Could not set folder permissions on $BaseDir." }
 if ($AllUsers) {
