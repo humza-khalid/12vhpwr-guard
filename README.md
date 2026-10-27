@@ -200,6 +200,10 @@ A crash or kill also toasts and writes event **9003**. The one exit it never res
 guard's own emergency shutdown: the shutdown note is already written, and a restarted guard would
 read it out and delete it before the next boot could warn you.
 
+It works the other way too: the guard watches its supervisor and stops within a second once the
+supervisor is gone, so stopping the scheduled task (which the installer and uninstaller both do)
+still stops everything.
+
 That is why Task Manager shows more `pythonw.exe` processes than before. Running the script
 with `--no-supervisor` starts the guard without it, for debugging; nothing restarts that one.
 

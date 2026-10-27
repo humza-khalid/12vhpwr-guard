@@ -3077,6 +3077,7 @@ def main():
         logger.warning(f"Restarted by the supervisor: the previous guard process exited "
                        f"with code {last_exit}.")
     stop_event = threading.Event()
+    watch_supervisor(lambda: _stop_because_supervisor_gone(stop_event, logger))
 
     # Create dialog service (dedicated Tk thread) before starting tray
     dialog = DialogService()
@@ -3108,6 +3109,13 @@ SUPERVISOR_CHILD_FLAG = "--child"
 NO_SUPERVISOR_FLAG = "--no-supervisor"
 # Tells a restarted guard why it is running, so its log says so.
 SUPERVISOR_LAST_EXIT_ENV = "TWELVEVHPWR_GUARD_LAST_EXIT"
+# The supervisor's process id, so the guard can end when its supervisor does. Stopping
+# the scheduled task ends the supervisor, but the venv launcher lets grandchildren
+# break away from its job, so without this the guard outlived it (measured on the rig
+# 2026-10-28): an upgrade would have kept the old code running, an uninstall a guard.
+SUPERVISOR_PID_ENV = "TWELVEVHPWR_GUARD_SUPERVISOR_PID"
+# How long a guard whose supervisor is gone gets to stop cleanly before it is ended.
+SUPERVISOR_GONE_HARD_EXIT_SEC = 10.0
 # Seconds before restarting after an unplanned exit, one step further per crash in a
 # row, so a guard that dies at startup cannot spin the CPU. A child that ran for
 # SUPERVISOR_STABLE_SEC before dying starts the sequence over.
@@ -3159,6 +3167,7 @@ def supervise(spawn=_spawn_guard, sleep=time.sleep, clock=time.monotonic,
     last_exit: Optional[int] = None
     while True:
         env = dict(os.environ)
+        env[SUPERVISOR_PID_ENV] = str(os.getpid())
         if last_exit is not None:
             env[SUPERVISOR_LAST_EXIT_ENV] = str(last_exit)
         started = clock()
@@ -3194,6 +3203,72 @@ def supervise(spawn=_spawn_guard, sleep=time.sleep, clock=time.monotonic,
             sleep(delay)
         except KeyboardInterrupt:
             return 0
+
+
+def _open_process_for_wait(pid: int):
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = wt.HANDLE
+    k32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+    SYNCHRONIZE = 0x00100000
+    return k32.OpenProcess(SYNCHRONIZE, False, pid)
+
+
+def _wait_for_process(handle) -> None:
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.WaitForSingleObject.restype = wt.DWORD
+    k32.WaitForSingleObject.argtypes = [wt.HANDLE, wt.DWORD]
+    k32.CloseHandle.argtypes = [wt.HANDLE]
+    INFINITE = 0xFFFFFFFF
+    try:
+        k32.WaitForSingleObject(handle, INFINITE)
+    finally:
+        k32.CloseHandle(handle)
+
+
+def watch_supervisor(on_gone, pid_text: Optional[str] = None,
+                     open_process=_open_process_for_wait,
+                     wait=_wait_for_process) -> Optional[threading.Thread]:
+    """Call on_gone() once the supervisor that started this guard has ended.
+
+    Does nothing for a guard nobody supervises (--no-supervisor, or an older launcher).
+    The handle is opened straight away, while the supervisor is certainly alive: it is
+    blocked waiting on this very process, so the id cannot have been reused yet. A
+    supervisor that cannot be opened is treated as already gone.
+    """
+    if pid_text is None:
+        pid_text = os.environ.get(SUPERVISOR_PID_ENV)
+    if not pid_text:
+        return None
+    try:
+        pid = int(pid_text)
+    except ValueError:
+        return None
+    handle = open_process(pid)
+    if not handle:
+        on_gone()
+        return None
+
+    def run():
+        wait(handle)
+        on_gone()
+
+    t = threading.Thread(target=run, name="supervisor-watch", daemon=True)
+    t.start()
+    return t
+
+
+def _stop_because_supervisor_gone(stop_event: threading.Event, logger: logging.Logger) -> None:
+    logger.warning("The supervisor process ended (the scheduled task was stopped or the "
+                   "supervisor was ended), so the guard is stopping as well.")
+    request_exit(0, stop_event)
+
+    def hard_exit():
+        # Only reached when the clean stop above is stuck; a clean stop ends the
+        # process first and takes this daemon thread with it.
+        time.sleep(SUPERVISOR_GONE_HARD_EXIT_SEC)
+        os._exit(0)
+
+    threading.Thread(target=hard_exit, name="supervisor-gone-exit", daemon=True).start()
 
 
 def entry(argv: List[str]) -> int:

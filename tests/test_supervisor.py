@@ -179,6 +179,65 @@ def test_a_planned_restart_writes_an_info_event_and_no_toast(monkeypatch):
     assert events[0][1] == 9003 and events[0][0] == g.win32con.EVENTLOG_INFORMATION_TYPE
 
 
+def test_the_child_is_told_the_supervisor_pid():
+    import os
+    _, spawned, _, _ = drive([1, 0])
+    assert all(env[g.SUPERVISOR_PID_ENV] == str(os.getpid()) for _, env in spawned)
+
+
+def test_an_unsupervised_guard_watches_nothing():
+    gone = []
+    assert g.watch_supervisor(lambda: gone.append(1), pid_text="") is None
+    assert g.watch_supervisor(lambda: gone.append(1), pid_text="not-a-pid") is None
+    assert gone == []
+
+
+def test_a_supervisor_that_cannot_be_opened_counts_as_gone():
+    gone = []
+    t = g.watch_supervisor(lambda: gone.append(1), pid_text="1234",
+                           open_process=lambda pid: None, wait=lambda h: pytest.fail("no wait"))
+    assert t is None and gone == [1]
+
+
+def test_the_guard_is_told_when_the_supervisor_ends():
+    gone, waited = [], []
+    t = g.watch_supervisor(lambda: gone.append(1), pid_text="1234",
+                           open_process=lambda pid: "handle", wait=waited.append)
+    t.join(5)
+    assert waited == ["handle"] and gone == [1]
+
+
+def test_a_real_supervisor_process_ending_is_noticed():
+    import subprocess
+    import threading
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    gone = threading.Event()
+    try:
+        t = g.watch_supervisor(gone.set, pid_text=str(proc.pid))
+        assert t is not None
+        assert not gone.wait(0.5), "still alive, so nothing yet"
+        proc.kill()
+        assert gone.wait(10), "the watcher noticed the process ending"
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_supervisor_gone_asks_for_a_clean_exit_first(monkeypatch):
+    import threading
+    requested, hard = [], []
+    monkeypatch.setattr(g, "request_exit", lambda code, ev: requested.append(code))
+    monkeypatch.setattr(g, "SUPERVISOR_GONE_HARD_EXIT_SEC", 0.0)
+    monkeypatch.setattr(g.os, "_exit", lambda code: hard.append(code))
+    logger = g.logging.getLogger("test-supervisor-gone")
+    g._stop_because_supervisor_gone(threading.Event(), logger)
+    for _ in range(50):
+        if hard:
+            break
+        g.time.sleep(0.05)
+    assert requested == [0] and hard == [0]
+
+
 def test_real_child_processes_are_restarted_until_a_clean_exit(tmp_path):
     """Exit 3, then 75, then 0, through real subprocesses and the real spawn function."""
     counter = tmp_path / "runs.txt"
