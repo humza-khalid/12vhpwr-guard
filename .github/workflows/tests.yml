@@ -6,8 +6,8 @@ on:
 
 jobs:
   pytest:
-    # Windows only: the guard imports ctypes.wintypes at module scope, so the
-    # test suite cannot even be collected anywhere else.
+    # The full suite. Most of it drives the Windows guard, which imports
+    # ctypes.WinDLL and pywin32 at module scope, so it only runs on Windows.
     runs-on: windows-latest
 
     steps:
@@ -19,6 +19,30 @@ jobs:
 
       - name: Install dependencies
         run: python -m pip install -r requirements.txt pytest
+
+      - name: Run tests
+        run: python -m pytest -q tests
+
+  pytest-linux:
+    # guard_core and the Linux daemon's pieces (v1.5). tests/conftest.py leaves the
+    # Windows-only files out of collection here (tests/platform_split.py works out
+    # which from their imports), so this needs nothing but pytest: the daemon is
+    # stdlib only. 3.10 is the oldest Python install.sh accepts.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install pytest
+        run: python -m pip install pytest
 
       - name: Run tests
         run: python -m pytest -q tests

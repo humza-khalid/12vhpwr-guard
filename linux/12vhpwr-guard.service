@@ -1,0 +1,70 @@
+# 12VHPWR Guard, Linux daemon (v1.5). Installed to /etc/systemd/system/ by linux/install.sh.
+#
+# Runs as root from boot, before anyone logs in. Root is needed for /dev/i2c-* (the pin monitor
+# chip), for NVML clock and power limit calls, for runuser (desktop notifications) and for
+# systemctl poweroff.
+#
+# Hardening is deliberately conservative: every option below was chosen because it cannot get
+# in the way of reading the sensor, limiting the GPU, notifying a user or powering off. Options
+# that could (PrivateDevices, ProtectKernelModules, DevicePolicy, CapabilityBoundingSet,
+# SystemCallFilter, RestrictAddressFamilies, PrivateNetwork, ProtectSystem=strict, User=) are
+# left out on purpose; tests/test_linux_packaging.py fails if one appears.
+
+[Unit]
+Description=12VHPWR Guard (per-pin 12V-2x6 connector current protection)
+Documentation=https://github.com/humza-khalid/12vhpwr-guard#readme
+# i2c-dev comes from /etc/modules-load.d/12vhpwr-guard.conf; start after it has been loaded.
+After=systemd-modules-load.service
+# Never give up restarting. With the default start limit (5 starts in 10 s) and RestartSec=2,
+# a crash loop would leave the unit failed and the machine unprotected with no further tries.
+StartLimitIntervalSec=0
+
+[Service]
+# The daemon sends READY=1 once it is running and WATCHDOG=1 on every loop through
+# $NOTIFY_SOCKET. A loop that stops pinging for WatchdogSec is killed and restarted.
+Type=notify
+NotifyAccess=main
+WatchdogSec=30
+Restart=always
+RestartSec=2
+
+# i2c-dev is not loaded at boot on Mint. The leading "-" means a failure here does not stop
+# the daemon from starting; it then reports "not protected" with the reason instead.
+ExecStartPre=-/sbin/modprobe i2c-dev
+ExecStart=/usr/bin/python3 /opt/12vhpwr-guard/linux/guardd.py
+
+# /run/12vhpwr-guard: state.json, mitigation.active (the recovery marker), guardd.lock.
+# 0755 so `12vhpwr-guard status` works without sudo.
+RuntimeDirectory=12vhpwr-guard
+RuntimeDirectoryMode=0755
+# Kept across a restart (automatic, after a crash or a watchdog kill, or systemctl restart),
+# so the next start finds the marker and puts the card back. Removed on a real stop, after the
+# daemon has released the limit itself. /run is tmpfs, so a reboot clears it together with the
+# GPU settings it describes.
+RuntimeDirectoryPreserve=restart
+# /var/lib/12vhpwr-guard: last_shutdown.json, which must survive the reboot it announces.
+StateDirectory=12vhpwr-guard
+StateDirectoryMode=0755
+# /var/log/12vhpwr-guard: flight_*.csv dumps (the daemon keeps the last 10).
+LogsDirectory=12vhpwr-guard
+LogsDirectoryMode=0755
+
+# Hardening, each line safe for this daemon:
+# Blocks gaining privileges through setuid/setgid binaries or file capabilities. The daemon
+# already is root; runuser only drops privileges (root to user), which this does not affect,
+# and wall works without its setgid tty bit because root can write to every terminal anyway.
+NoNewPrivileges=yes
+# /usr, /boot, /efi and /etc read-only. The daemon only reads its code (/opt) and config
+# (/etc/12vhpwr-guard, /etc/gpu-uv); everything it writes is in the three directories above,
+# which systemd keeps writable. modprobe only reads /usr/lib/modules.
+ProtectSystem=full
+# /home, /root and /run/user read-only (not hidden). Nothing here writes there. Read-only keeps
+# /run/user/<uid>/bus reachable: connecting to a Unix socket is not a write to the filesystem,
+# so notify-send still gets to each user's session bus.
+ProtectHome=read-only
+# A private /tmp and /var/tmp. Nothing in the daemon, runuser or notify-send shares files
+# through /tmp with anyone else.
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

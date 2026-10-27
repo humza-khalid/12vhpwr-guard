@@ -21,7 +21,15 @@ import types
 import pytest
 
 import guard_core as core
-import hwinfo_12vhpwr_guard as g
+
+# Suites A1, B and C need only guard_core, so they also run on Linux (the ubuntu-latest CI
+# job), where the Windows module cannot import. The import sits in a try for that reason;
+# tests/platform_split.py does not count an import inside a try, so this file stays collected
+# there. A2 and suite D take the `guard` fixture, which conftest turns into a skip off Windows.
+try:
+    import hwinfo_12vhpwr_guard as g
+except Exception:
+    g = None
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -85,8 +93,18 @@ class PlainMitigator:
 
 
 @pytest.fixture
-def platform_untouched(guard, monkeypatch):
-    """Fails the test if anything reaches the Windows module's toast or Event Viewer."""
+def platform_untouched(request):
+    """Fails the test if anything reaches the Windows module's toast or Event Viewer.
+
+    Without the Windows module (Linux) there is nothing guard_core could reach, so it only
+    yields. With it, `guard` is set up before `monkeypatch` exactly as when both were
+    arguments, so teardown order (monkeypatch undone first, then guard) is unchanged.
+    """
+    if g is None:
+        yield []
+        return
+    request.getfixturevalue("guard")
+    monkeypatch = request.getfixturevalue("monkeypatch")
     touched = []
     monkeypatch.setattr(g, "HAVE_EVENTLOG", True)
     monkeypatch.setattr(g, "eventlog_write", lambda *a: touched.append(("eventlog", a)))

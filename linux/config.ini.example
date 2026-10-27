@@ -1,0 +1,52 @@
+# 12VHPWR Guard, Linux configuration.
+#
+# install.sh copies this file to /etc/12vhpwr-guard/config.ini on a first install only, and
+# never overwrites a config that is already there. The keys and defaults are the same as the
+# Windows guard's config.ini; see the README's configuration section for the details.
+#
+# Read once at startup. After an edit: sudo systemctl restart 12vhpwr-guard
+#
+# Comments must be on their own line. A comment after a value ("9.5  # amps") makes that value
+# unreadable, and the key falls back to its default.
+
+[Settings]
+# Per-pin current, in amps, that starts the tier 1 timer.
+threshold_amps = 9.5
+# How long a pin must stay over threshold_amps before tier 1 acts, in seconds.
+sustained_seconds_required = 15.0
+# Where the readings come from. Linux has only the direct reader (the card's own monitor chip
+# over /dev/i2c-N); auto and astral both mean that. hwinfo exists only on Windows.
+sensor_backend = auto
+# tiered: limit the GPU first, shut down only if that is not enough.
+# shutdown_only: skip the GPU limit and shut down when a tier fires.
+response_mode = tiered
+# Seconds without any sensor, after the sensor has been read once, before the daemon exits so
+# systemd restarts it. 0 turns this off and the daemon waits instead.
+sensor_loss_restart_seconds = 300.0
+
+# Tier 2: current high enough to skip tier 1's window, and how long it must last.
+critical_amps = 13.0
+critical_seconds = 3.0
+# Tier 3: limit and shut down at once, on 2 consecutive samples.
+catastrophic_amps = 16.0
+# How long a limited GPU has to bring the current down before the guard shuts down instead.
+mitigation_grace_seconds = 10.0
+# How long all pins must stay clear before the limit lifts.
+mitigation_clear_seconds = 60.0
+# Minimum time the limit stays on, however fast the current falls.
+mitigation_min_hold_seconds = 120.0
+# A tier firing again this soon after a release is a persistent fault, and shuts down.
+retrigger_window_seconds = 600.0
+
+# on or off. Off silences the warn-only advisories (dead pin, imbalance) completely.
+advisories = on
+# The six pins must total at least this many amps before any advisory can start.
+advisory_load_amps = 18.0
+# A pin at or below this while the others carry real load is an open pin.
+dead_pin_max_amps = 0.5
+# Busiest minus quietest pin at or above this is an imbalance.
+imbalance_spread_amps = 3.0
+# How long a condition must hold before the first warning, in seconds.
+advisory_sustain_seconds = 10.0
+# How often a warning repeats while the condition lasts, in seconds.
+advisory_repeat_seconds = 600.0

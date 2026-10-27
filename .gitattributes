@@ -1,0 +1,8 @@
+# Files that run on Linux keep LF line endings even in a Windows checkout with
+# core.autocrlf=true. Bash refuses a CRLF script ($'\r': command not found), systemd reads
+# the \r into unit values, and a #! line with a trailing \r names an interpreter that does
+# not exist. The Linux install is often run straight from a Windows drive, so the working
+# copy itself has to be LF, not just the repository.
+*.sh text eol=lf
+*.service text eol=lf
+linux/** text eol=lf
