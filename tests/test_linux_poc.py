@@ -511,18 +511,19 @@ def test_running_off_linux_exits_one():
 def test_no_write_path_exists_in_the_module():
     """The read-only guarantee is structural: nothing here may put bytes on the bus.
 
-    The two removed constants are on the banned list as well. The repeated-START path is what
-    silently returned zeros on this hardware, so it must not creep back in as a fallback.
+    Since v1.5 the bus access itself lives in linux/astral_linux.py, whose own test applies
+    the full structural ban (READ only, exactly FUNCS/SLAVE/SMBUS, one fcntl call site). What
+    is left to hold here: the tool makes no ioctl of its own (it only hands its _ioctl seam to
+    the backend), opens every descriptor read-only, and carries none of the banned paths. The
+    repeated-START path is on the banned list because it silently returned zeros on this
+    hardware, so it must not creep back in as a fallback.
     """
     source = TOOL_PATH.read_text(encoding="utf-8")
-    assert sorted(re.findall(r"_ioctl\(fd, (\w+)", source)) == [
-        "I2C_FUNCS", "I2C_SLAVE", "I2C_SMBUS"
-    ]
+    assert "fcntl" not in source, "the only ioctl call site is in linux/astral_linux.py"
+    requests = re.findall(r"(?<![\w.])_?ioctl\(\s*\w+\s*,\s*(\w+)", source)
+    assert not requests, f"the tool must not issue ioctl requests itself: {requests}"
+    assert source.count("ioctl=_ioctl") == 2, "both wrappers hand the backend this module's seam"
     assert re.findall(r"os\.open\([^)]*?,\s*(os\.\w+)", source) == ["os.O_RDONLY"] * 2
     for banned in ("os.write", "O_WRONLY", "O_RDWR", "I2C_SMBUS_WRITE",
-                   "write_byte", "write_block", "I2C_RDWR", "I2C_M_RD"):
+                   "write_byte", "write_block", "I2C_RDWR", "I2C_M_RD", "I2C_SLAVE_FORCE"):
         assert banned not in source, f"{banned} must not appear in a read-only tool"
-
-    directions = re.findall(r"read_write\s*=\s*(\w+)", source)
-    assert directions, "the transaction must state its direction explicitly"
-    assert set(directions) == {"I2C_SMBUS_READ"}, directions
