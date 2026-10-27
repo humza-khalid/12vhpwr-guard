@@ -29,12 +29,42 @@ handles the case that is not self-healing, a crash while mitigated followed by a
 restart on the same driver session.
 """
 
+import configparser
 import ctypes
-import ctypes.wintypes as wt
 import json
 import os
 import time
 from typing import Optional, Tuple
+
+# The same module drives the card on Linux (v1.5): NVML is libnvidia-ml.so.1 there and
+# "elevated" means root. Nothing Windows-specific is imported at module level, so the
+# Linux daemon can import this file. A module flag rather than inline os.name checks,
+# so the tests can exercise both platforms on one machine.
+_IS_WINDOWS = os.name == "nt"
+NVML_LIBRARY_WINDOWS = "nvml.dll"
+NVML_LIBRARY_NAMES_LINUX = ("libnvidia-ml.so.1", "libnvidia-ml.so")
+
+# gpu-uv (the owner's Linux undervolt tool) caps a positive clock offset with a clock
+# lock of [lowest supported clock, max_clock_mhz]. Resetting the lock on release would
+# leave that offset uncapped, an untested overclock right after a trip, so on Linux
+# release puts gpu-uv's lock back instead. The path, section and key are a contract
+# pinned on the gpu-uv side by its test_guard_contract_key_is_stable.
+GPU_UV_CONFIG = "/etc/gpu-uv/gpu-uv.conf"
+GPU_UV_SECTION = "undervolt"
+GPU_UV_KEY = "max_clock_mhz"
+
+
+def gpu_uv_clock_cap(path: str) -> Tuple[bool, Optional[int]]:
+    """(config present, max_clock_mhz). A present but unreadable config is (True, None)."""
+    if not os.path.exists(path):
+        return False, None
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(path, encoding="utf-8")
+        value = parser.getint(GPU_UV_SECTION, GPU_UV_KEY)
+    except (configparser.Error, ValueError, OSError):
+        return True, None
+    return True, value if value > 0 else None
 
 # ------------------------------------------------------------------ NVML ids
 NVML_SUCCESS = 0
@@ -85,9 +115,12 @@ def is_process_elevated() -> bool:
 
     Asked of the process token rather than answered by attempting a "set" call and
     seeing what happens: a probe write is a side effect, and a safety tool does not
-    poke the GPU to learn about itself.
+    poke the GPU to learn about itself. On Linux the NVML set calls need root.
     """
+    if not _IS_WINDOWS:
+        return hasattr(os, "geteuid") and os.geteuid() == 0
     try:
+        import ctypes.wintypes as wt
         advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
@@ -140,13 +173,29 @@ class _Nvml:
         self._dll = None
         self._fn = {}
         self._initialized = False
+        self.library_name = NVML_LIBRARY_WINDOWS if _IS_WINDOWS else NVML_LIBRARY_NAMES_LINUX[0]
+
+    def _load_library(self):
+        """nvml.dll on Windows; libnvidia-ml.so.1 (then the unversioned name) on Linux."""
+        if _IS_WINDOWS:
+            self.library_name = NVML_LIBRARY_WINDOWS
+            return ctypes.WinDLL(NVML_LIBRARY_WINDOWS)
+        last_error = None
+        for name in NVML_LIBRARY_NAMES_LINUX:
+            try:
+                lib = ctypes.CDLL(name)
+                self.library_name = name
+                return lib
+            except OSError as ex:
+                last_error = ex
+        raise OSError(f"could not load {' or '.join(NVML_LIBRARY_NAMES_LINUX)} ({last_error})")
 
     def _bind(self, name: str, restype, argtypes, required: bool = True):
         try:
             fn = getattr(self._dll, name)
         except AttributeError:
             if required:
-                raise RuntimeError(f"{name} missing from nvml.dll (driver too old)")
+                raise RuntimeError(f"{name} missing from {self.library_name} (driver too old)")
             return None
         fn.restype = restype
         fn.argtypes = argtypes
@@ -162,7 +211,7 @@ class _Nvml:
             raise NvmlError(name, status)
 
     def init(self) -> None:
-        self._dll = ctypes.WinDLL("nvml.dll")
+        self._dll = self._load_library()
 
         c_uint_p = ctypes.POINTER(ctypes.c_uint32)
         handle_p = ctypes.POINTER(ctypes.c_void_p)
@@ -309,12 +358,20 @@ class GpuMitigator:
     tick without tracking whether they already happened.
     """
 
+    # Passed for gpu_uv_config to mean "the platform default": the gpu-uv rule is on at
+    # GPU_UV_CONFIG on Linux and off on Windows, where gpu-uv does not exist and
+    # Afterburner's own curve keeps the card capped after a plain clock reset.
+    PLATFORM_DEFAULT = object()
+
     def __init__(self, marker_path: Optional[str] = None, nvml_factory=None,
-                 elevation_check=None, logger=None):
+                 elevation_check=None, logger=None, gpu_uv_config=PLATFORM_DEFAULT):
         self._marker_path = marker_path or MARKER_PATH
         self._nvml_factory = nvml_factory or _Nvml
         self._elevation_check = elevation_check or is_process_elevated
         self._log = logger
+        if gpu_uv_config is GpuMitigator.PLATFORM_DEFAULT:
+            gpu_uv_config = None if _IS_WINDOWS else GPU_UV_CONFIG
+        self._gpu_uv_config: Optional[str] = gpu_uv_config
 
         self._nvml = None
         self._handle = None
@@ -355,10 +412,16 @@ class GpuMitigator:
             return True
 
         if not self._elevation_check():
-            self.unavailable_reason = "not elevated"
-            self._say("warning",
-                      "unavailable (guard is not running elevated). Protection falls back "
-                      "to shutdown-only. Install as a scheduled task, or run as admin.")
+            if _IS_WINDOWS:
+                self.unavailable_reason = "not elevated"
+                self._say("warning",
+                          "unavailable (guard is not running elevated). Protection falls back "
+                          "to shutdown-only. Install as a scheduled task, or run as admin.")
+            else:
+                self.unavailable_reason = "not root"
+                self._say("warning",
+                          "unavailable (guard is not running as root). Protection falls back "
+                          "to shutdown-only. Run it as the installed service, or with sudo.")
             return False
 
         nvml = self._nvml_factory()
@@ -604,11 +667,10 @@ class GpuMitigator:
                                    "be at its minimum limit")
 
         if self._applied_clocks:
-            try:
-                self._nvml.reset_locked_clocks(self._handle)
-            except Exception as ex:
+            problem = self._release_clock_lock()
+            if problem is not None:
                 restored = False
-                self._say("error", f"could not reset locked clocks ({ex})")
+                self._say("error", problem)
 
         self.engaged = False
         self.engaged_reason = None
@@ -625,6 +687,43 @@ class GpuMitigator:
             self._say("info", "released - clocks unlocked and power limit restored")
         return restored
 
+    def _release_clock_lock(self, recovering: bool = False) -> Optional[str]:
+        """Undo our floor clock lock. Returns None on success, else the problem text.
+
+        Without gpu-uv (always on Windows) this is the plain reset it always was, with
+        the same failure wording. With a gpu-uv config present, the owner's own lock of
+        [lowest supported clock, max_clock_mhz] goes back instead, because a reset would
+        leave gpu-uv's positive offset with no cap. When that lock cannot be rebuilt
+        (unreadable config, or no enumerated lowest clock) our floor lock is left in
+        place: slow and visible, never an untested overclock.
+        """
+        present, cap = (False, None)
+        if self._gpu_uv_config:
+            present, cap = gpu_uv_clock_cap(self._gpu_uv_config)
+        if not present:
+            try:
+                self._nvml.reset_locked_clocks(self._handle)
+                return None
+            except Exception as ex:
+                return f"clock reset failed ({ex})" if recovering else \
+                    f"could not reset locked clocks ({ex})"
+
+        if not cap:
+            return (f"gpu-uv config {self._gpu_uv_config} is unreadable, so the floor clock "
+                    f"lock is left in place; run `sudo gpu-uv apply` to restore the undervolt")
+        floor = self.clock_floor_mhz
+        if not floor:
+            return ("the driver did not report its lowest clock, so gpu-uv's clock lock "
+                    "cannot be rebuilt and the floor clock lock is left in place; run "
+                    "`sudo gpu-uv apply` to restore the undervolt")
+        try:
+            self._nvml.set_locked_clocks(self._handle, floor, cap)
+        except Exception as ex:
+            return (f"could not put gpu-uv's {floor}-{cap} MHz clock lock back ({ex}); run "
+                    f"`sudo gpu-uv apply`")
+        self._say("info", f"clock lock handed back to gpu-uv ({floor}-{cap} MHz)")
+        return None
+
     # -- crash recovery -----------------------------------------------------
     def startup_recovery(self) -> Optional[str]:
         """Undo a mitigation left behind by a guard that died while engaged.
@@ -638,19 +737,22 @@ class GpuMitigator:
 
         if not self.connect(marker.get("subsystem_id")):
             self._clear_marker()
+            # A plain clock reset would uncap gpu-uv's offset, so with gpu-uv installed
+            # its own apply is the way back.
+            gpu_uv = bool(self._gpu_uv_config) and gpu_uv_clock_cap(self._gpu_uv_config)[0]
+            fix = "sudo gpu-uv apply" if gpu_uv else "nvidia-smi -rgc"
             return ("Found a leftover mitigation marker but cannot reach the GPU "
                     f"({self.unavailable_reason}). If the card is still limited, reboot "
-                    "or reset it with: nvidia-smi -rgc")
+                    f"or reset it with: {fix}")
 
         saved = marker.get("saved_power_limit_mw")
         problems = []
         self.last_restore_warning = None
         self._restore_unverified = False
 
-        try:
-            self._nvml.reset_locked_clocks(self._handle)
-        except Exception as ex:
-            problems.append(f"clock reset failed ({ex})")
+        clock_problem = self._release_clock_lock(recovering=True)
+        if clock_problem is not None:
+            problems.append(clock_problem)
 
         if marker.get("applied_power_limit"):
             if saved:
