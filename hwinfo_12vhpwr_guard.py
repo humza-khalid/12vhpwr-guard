@@ -3087,6 +3087,14 @@ def main():
 
     run_tray(stop_event)
 
+    # The tray is gone, but the monitor thread's cleanup is what puts the GPU limit back
+    # and logs the stop, and it is a daemon thread: returning straight away ended the
+    # process under it, so an Exit while limited left the card at its floor until the
+    # next start's recovery. Give it the time it needs, short of the supervisor-gone
+    # hard exit.
+    stop_event.set()
+    t.join(MONITOR_EXIT_JOIN_SEC)
+
     # 0 for a stop the user asked for, which the supervisor leaves alone.
     # RESTART_EXIT_CODE when the guard asked to be started again.
     sys.exit(pending_exit_code())
@@ -3116,6 +3124,9 @@ SUPERVISOR_LAST_EXIT_ENV = "TWELVEVHPWR_GUARD_LAST_EXIT"
 SUPERVISOR_PID_ENV = "TWELVEVHPWR_GUARD_SUPERVISOR_PID"
 # How long a guard whose supervisor is gone gets to stop cleanly before it is ended.
 SUPERVISOR_GONE_HARD_EXIT_SEC = 10.0
+# How long main() waits for the monitor thread's cleanup on exit. Under the hard exit
+# above, so a supervisor-gone stop still ends cleanly when the cleanup is healthy.
+MONITOR_EXIT_JOIN_SEC = 8.0
 # Seconds before restarting after an unplanned exit, one step further per crash in a
 # row, so a guard that dies at startup cannot spin the CPU. A child that ran for
 # SUPERVISOR_STABLE_SEC before dying starts the sequence over.

@@ -238,6 +238,31 @@ def test_supervisor_gone_asks_for_a_clean_exit_first(monkeypatch):
     assert requested == [0] and hard == [0]
 
 
+def test_main_waits_for_the_monitor_cleanup_before_exiting(monkeypatch):
+    """Exit from the tray must not end the process under the monitor's cleanup, which is
+    where the GPU limit goes back and the stop is logged."""
+    import logging
+    import threading
+    finished = threading.Event()
+
+    def slow_monitor(stop_event, logger):
+        stop_event.wait(5)
+        g.time.sleep(0.3)          # the release and the "stopped" line take a moment
+        finished.set()
+
+    monkeypatch.setattr(g, "acquire_single_instance", lambda: True)
+    monkeypatch.setattr(g, "setup_logger", lambda: logging.getLogger("test-main-exit"))
+    monkeypatch.setattr(g, "DialogService", lambda: object())
+    monkeypatch.setattr(g, "monitor_loop", slow_monitor)
+    monkeypatch.setattr(g, "run_tray", lambda stop_event: None)   # the user chose Exit
+    monkeypatch.delenv(g.SUPERVISOR_PID_ENV, raising=False)
+    monkeypatch.delenv(g.SUPERVISOR_LAST_EXIT_ENV, raising=False)
+    with pytest.raises(SystemExit) as info:
+        g.main()
+    assert info.value.code == 0
+    assert finished.is_set(), "main() returned before the monitor thread finished its cleanup"
+
+
 def test_real_child_processes_are_restarted_until_a_clean_exit(tmp_path):
     """Exit 3, then 75, then 0, through real subprocesses and the real spawn function."""
     counter = tmp_path / "runs.txt"
