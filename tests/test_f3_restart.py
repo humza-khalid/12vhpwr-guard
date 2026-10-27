@@ -223,7 +223,7 @@ def test_c1_the_direct_sensor_staying_gone_restarts_the_process(loop_env, monkey
         assert wait_until(connected, 5.0), "the direct sensor connected first"
         lose_the_sensor()
 
-        assert wait_until(lambda: exit_code() == 1, WINDOW * 20), \
+        assert wait_until(lambda: exit_code() == g.RESTART_EXIT_CODE, WINDOW * 20), \
             f"it asked for exit code 1: {gm.get_state()}"
         assert run.stop.is_set(), "and stopped the monitor loop"
         run.thread.join(timeout=JOIN_TIMEOUT)
@@ -262,7 +262,7 @@ def test_c2_the_restart_writes_event_9002(loop_env, monkeypatch):
     with loop_thread() as run:
         assert wait_until(connected, 5.0)
         lose_the_sensor()
-        assert wait_until(lambda: exit_code() == 1, WINDOW * 20)
+        assert wait_until(lambda: exit_code() == g.RESTART_EXIT_CODE, WINDOW * 20)
         run.thread.join(timeout=JOIN_TIMEOUT)
 
     nines = [e for e in events if e[1] == 9002]
@@ -336,7 +336,7 @@ def test_c5_a_reconnect_starts_the_clock_again(loop_env, monkeypatch):
         lose_the_sensor()
         assert wait_until(blind, 5.0)
         second_loss = time.time()
-        assert wait_until(lambda: exit_code() == 1, SLOW_WINDOW * 10), \
+        assert wait_until(lambda: exit_code() == g.RESTART_EXIT_CODE, SLOW_WINDOW * 10), \
             f"the second outage restarts too: {gm.get_state()}"
         blind_for = time.time() - second_loss
 
@@ -368,7 +368,7 @@ def test_c6_a_fallback_to_hwinfo_counts_as_a_source(loop_env, monkeypatch):
         assert exit_code() == 0, "a fallback source is a source"
 
         lose_the_sensor()
-        assert wait_until(lambda: exit_code() == 1, SLOW_WINDOW * 10), \
+        assert wait_until(lambda: exit_code() == g.RESTART_EXIT_CODE, SLOW_WINDOW * 10), \
             f"no source at all, and a direct session was lost earlier: {gm.get_state()}"
         run.thread.join(timeout=JOIN_TIMEOUT)
 
@@ -394,7 +394,7 @@ def test_c7_a_paused_guard_does_not_restart(loop_env, monkeypatch):
 
         gm.set_state(paused=False)
         resumed = time.time()
-        assert wait_until(lambda: exit_code() == 1, SLOW_WINDOW * 10), \
+        assert wait_until(lambda: exit_code() == g.RESTART_EXIT_CODE, SLOW_WINDOW * 10), \
             f"and it restarts once it is watching again: {gm.get_state()}"
         after_resume = time.time() - resumed
 

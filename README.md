@@ -58,11 +58,11 @@ This tool adds a last-line, OS-level safety net by:
 - Quiet rotating file logs
 - **Detects sensor loss** (HWiNFO exit/crash/freeze, or I2C failure) and auto-reconnects; never reports OK on stale data
 - **Recovers from a driver update**: if the card's sensor path dies and stays dead for 5
-  minutes, the guard restarts itself through Task Scheduler and comes back with a fresh driver
-  session
+  minutes, the guard restarts itself and comes back with a fresh driver session
 - **Resets its timer across sleep/resume** instead of trusting a stale reading
-- **Single-instance guard** (a second copy exits instead of double-monitoring)
-- Uses **Task Scheduler as watchdog**
+- **Single-instance guard** (one guard per PC, even with several Windows accounts signed in; a second copy exits instead of double-monitoring)
+- **Restarts itself within seconds if it crashes or is killed** (a small built-in supervisor;
+  Task Scheduler starts it at logon)
 
 ---
 
@@ -85,6 +85,7 @@ chip that measures each 12VHPWR pin individually. Recognized models (by PCI subs
 | `1043:8A5A` | ROG Astral RTX 5090 BTF OC (see BTF note) |
 | `1043:8A3C` | ROG Astral RTX 5090 BTF OC, second id revision of the same card (see BTF note) |
 | `1043:89DF` | ROG Astral RTX 5080 (non-OC) |
+| `1043:89FF` | ROG Astral RTX 5090, newer id revision (owner report, awaiting confirmation) |
 
 **BTF note:** the BTF card is supported when it draws power through the normal 16-pin cable
 in a standard motherboard, which is where its card-side sensors sit. Installed in an actual
@@ -171,9 +172,9 @@ rig that was 131 reconnect attempts in a row, all failed, with the card unprotec
 scheduled task was restarted by hand. A new process gets a new driver session, so since v1.4
 the guard does that itself: if it has **no source at all for 5 minutes** after having read the
 direct sensor earlier in that session, it logs the reason, writes event **9002**, toasts, and
-exits with a failure code. Task Scheduler is configured to restart a failed run (999 times, one
-minute apart), so the guard is back within about a minute with a clean session, and the log
-shows a fresh "Starting" line.
+exits with its restart code. The guard's supervisor (below) starts it again two seconds later
+with a clean session, and the log shows a fresh "Starting" line followed by "Restarted by the
+supervisor".
 
 Two cases deliberately never restart:
 
@@ -184,9 +185,28 @@ Two cases deliberately never restart:
   same way.
 
 Time spent **paused** does not count either: a paused guard is not trying to reconnect, and the
-clock starts over when you resume. The restart is what Task Scheduler makes of a failed run, so
-a guard started by hand from a console has nothing to bring it back and will simply exit. The
-window is `sensor_loss_restart_seconds` in `config.ini`, and `0` turns the whole behaviour off.
+clock starts over when you resume. The window is `sensor_loss_restart_seconds` in
+`config.ini`, and `0` turns the whole behaviour off.
+
+### If the guard crashes or is killed
+
+Task Scheduler's "restart on failure" only covers a task that fails to start. A guard that
+started and then died was never brought back by it: on this project's rig in October 2026 the
+guard was killed and stayed down, with 999 restarts configured. So since v1.4 the process the
+task starts is a small supervisor that runs the real guard as a child process and does nothing
+else. If the guard exits for any reason other than you choosing **Exit** from the tray, the
+supervisor starts it again: after 2 seconds for the planned self-restart above, otherwise after
+5 seconds, backing off to a minute if it keeps dying so a startup problem cannot spin the CPU.
+A crash or kill also toasts and writes event **9003**. The one exit it never restarts is the
+guard's own emergency shutdown: the shutdown note is already written, and a restarted guard would
+read it out and delete it before the next boot could warn you.
+
+It works the other way too: the guard watches its supervisor and stops within a second once the
+supervisor is gone, so stopping the scheduled task (which the installer and uninstaller both do)
+still stops everything.
+
+That is why Task Manager shows more `pythonw.exe` processes than before. Running the script
+with `--no-supervisor` starts the guard without it, for debugging; nothing restarts that one.
 
 ---
 
@@ -416,16 +436,59 @@ The easiest way to install 12VHPWR Guard is using the included installer.
    - Create a default `config.ini` if none exists
    - Create a `logs` folder
    - Register the **"12VHPWR Guard"** Event Viewer source (if permitted)
+   - Lock down the folder so only administrators can change the code (see
+     [Multiple Windows accounts](#multiple-windows-accounts))
    - Create a **scheduled task** named **"12VHPWR Guard"** that:
-     - Runs at user logon
+     - Runs at logon of your account, or of every account if you answer `y` to the
+       all-accounts question
      - Starts the guard with `pythonw.exe` (no console window)
-     - Restarts automatically on failure (up to 999 times, 1-minute interval)
+     - Restarts the guard within seconds if it crashes or is killed (the built-in
+       supervisor), and retries a launch that fails up to 999 times, 1 minute apart
      - Runs indefinitely: the default 72-hour Task Scheduler execution limit is disabled,
        and battery-power settings will not stop it
 
-4. When asked **"Start 12VHPWR Guard now? (y/N)"**, type `y` and Enter to start immediately, or `N` to have it start at next logon.
+4. When asked **"Start 12VHPWR Guard for every Windows account on this PC?"**, answer `N`
+   (the default) if only you use this PC, or `y` if other people log on to it as well. See
+   [Multiple Windows accounts](#multiple-windows-accounts).
+
+5. When asked **"Start 12VHPWR Guard now? (y/N)"**, type `y` and Enter to start immediately, or `N` to have it start at next logon.
 
 **After installation:** The guard runs from the system tray. You'll see the 12VHPWR Guard icon when it's active. On a supported Astral card nothing else is needed; hover the icon and the tooltip should read `... | direct`. Only if you use the `hwinfo` backend does **HWiNFO64** need to be running with **Shared Memory Support** and the per-pin sensors enabled.
+
+### Multiple Windows accounts
+
+By default the guard starts only when the account that ran the installer logs on. If other
+people use the PC with their own Windows accounts, answer `y` to **"Start 12VHPWR Guard for
+every Windows account on this PC?"**. The task is then registered for the built-in Users
+group, so it starts for whoever logs on, in their own session, with the tray icon on their
+desktop.
+
+Before it does that, the installer checks two things that would otherwise stop it working
+for the other accounts:
+
+- **The folder is not inside a user profile.** Other accounts cannot read `C:\Users\<you>\...`
+  (Desktop, Downloads and so on). Put it somewhere like `C:\12vhpwr_guard`.
+- **Python is installed for all users.** The python.org "Install Now" button installs Python
+  inside your own profile, where other accounts cannot run it. Reinstall with *Customize
+  installation* and tick *Install Python for all users*, delete the `venv` folder, and run the
+  installer again.
+
+What the other accounts get depends on their account type:
+
+- **Administrator accounts** get the full guard, including the GPU clock and power limit.
+- **Standard accounts** get monitoring, the tray icon, warnings and the emergency shutdown,
+  but not the GPU clock and power limit, because Windows only lets administrators change
+  those.
+
+Only one guard runs per PC. If a second person logs on while the first is still signed in
+(switch user), the first person's guard keeps protecting the card in the background and the
+second person sees no tray icon. If the first person then signs out, the guard starts again
+at the next logon.
+
+The installer also removes write access to the program folder for everyone except
+administrators, in both modes. The guard runs with administrator rights, so anyone who can
+edit its files could get their own code run as administrator. Standard accounts can still
+write the logs and `config.ini`, which is all the guard needs from them.
 
 ---
 
@@ -498,7 +561,8 @@ If you prefer not to use the installer or need a custom setup:
    - **Arguments:** `hwinfo_12vhpwr_guard.py`
    - **Start in:** project folder (e.g. `C:\12vhpwr_guard`)
    - **Trigger:** At log on  
-   - **Settings:** Restart on failure suggested, and set **"Stop the task if it runs longer
+   - **Settings:** Restart on failure suggested (it only covers a launch that fails; the
+     guard's own supervisor handles crashes), and set **"Stop the task if it runs longer
      than"** to **disabled**; the Task Scheduler default silently kills the guard after
      72 hours of uptime
 
@@ -592,7 +656,11 @@ the sensor-path check is **7003** (no current on any pin), all three warnings. *
 
 Event ID **9002** (error) is the self-restart after a long sensor loss, described under
 [When the sensor source goes away](#when-the-sensor-source-goes-away). It is followed by the
-usual **1003** stopped entry, and then a **1000** start from the run Task Scheduler brings up.
+usual **1003** stopped entry, and then a **1000** start from the run the supervisor brings up.
+
+Event ID **9003** is the supervisor starting the guard again: information after the planned
+self-restart, a warning after a crash or a kill. See
+[If the guard crashes or is killed](#if-the-guard-crashes-or-is-killed).
 
 ---
 
@@ -627,7 +695,7 @@ sensor_loss_restart_seconds = 300.0
 
 | Key | Meaning |
 |---|---|
-| `sensor_loss_restart_seconds` | How long the guard goes without any sensor source, after having read the direct sensor, before it exits so Task Scheduler restarts it. `0` turns the self-restart off and it waits instead |
+| `sensor_loss_restart_seconds` | How long the guard goes without any sensor source, after having read the direct sensor, before it exits so the supervisor restarts it. `0` turns the self-restart off and it waits instead |
 
 **Tier settings.** These are optional and only read at startup. Leave them out and the
 defaults below apply:

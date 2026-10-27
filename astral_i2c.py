@@ -79,6 +79,10 @@ ASTRAL_SUBSYSTEM_IDS = {
     # Field-verified in issue #6: owner's nvidia-smi id, then green with live amp readings
     # under load on v1.3.1. OpenRGB lists it as ASTRAL_RTX_5080_16G_GAMING.
     0x89DF1043: "ROG Astral RTX 5080 (non-OC)",
+    # Owner report in issue #9 (GPU-Z: 10DE 2B85 - 1043 89FF, Astral default boost 2580 MHz,
+    # owner says IT8915FN present). Not in the OpenRGB or astral-hwmon registries yet, so
+    # this is the first id added on the owner's report alone; awaiting field verification.
+    0x89FF1043: "ROG Astral RTX 5090 (89FF revision)",
 }
 
 # Labels must match the HWiNFO backend exactly so downstream code is source-agnostic.
