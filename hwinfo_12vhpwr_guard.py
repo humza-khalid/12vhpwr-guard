@@ -7,6 +7,7 @@ import time
 import subprocess
 import threading
 import logging
+import math
 import configparser
 import queue
 import xml.etree.ElementTree as ET
@@ -232,7 +233,10 @@ def load_config() -> dict:
         mode = config.get("Settings", "response_mode", fallback=DEFAULT_RESPONSE_MODE).strip().lower()
 
         # Validate
-        if threshold <= 0 or sustained <= 0:
+        # nan slips past a <= 0 test and inf is not a threshold: either would
+        # silently switch tier 1 off, so both count as invalid like a negative.
+        if (not (math.isfinite(threshold) and math.isfinite(sustained))
+                or threshold <= 0 or sustained <= 0):
             raise ValueError("Values must be positive")
         if backend not in VALID_SENSOR_BACKENDS:
             backend = DEFAULT_SENSOR_BACKEND
@@ -250,14 +254,14 @@ def load_config() -> dict:
         # file is still worth honouring.
         for key, fallback in DEFAULT_TIER_VALUES.items():
             value = config.getfloat("Settings", key, fallback=fallback)
-            loaded[key] = value if value > 0 else fallback
+            loaded[key] = value if math.isfinite(value) and value > 0 else fallback
 
         # Same rule for the advisory numbers, and the on/off flag on top.
         for key, fallback in DEFAULT_ADVISORY_VALUES.items():
             if key == "advisories_enabled":
                 continue
             value = config.getfloat("Settings", key, fallback=fallback)
-            loaded[key] = value if value > 0 else fallback
+            loaded[key] = value if math.isfinite(value) and value > 0 else fallback
         loaded["advisories_enabled"] = _config_bool(
             config, ADVISORIES_CONFIG_KEY, DEFAULT_ADVISORIES_ENABLED
         )
@@ -270,7 +274,8 @@ def load_config() -> dict:
             fallback=DEFAULT_SENSOR_LOSS_RESTART_SECONDS,
         )
         loaded["sensor_loss_restart_seconds"] = (
-            restart_after if restart_after >= 0 else DEFAULT_SENSOR_LOSS_RESTART_SECONDS
+            restart_after if math.isfinite(restart_after) and restart_after >= 0
+            else DEFAULT_SENSOR_LOSS_RESTART_SECONDS
         )
         return loaded
     except Exception:

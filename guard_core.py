@@ -15,8 +15,10 @@ hwinfo_12vhpwr_guard.py re-exports every public name here, so `g.<name>` keeps
 working for the tests and for anything else that reads it from there.
 """
 
+import configparser
 import glob
 import logging
+import math
 import os
 import sys
 import time
@@ -169,6 +171,32 @@ CLEAR_STABLE_SECONDS = 1.0
 FLIGHT_SAMPLES = 120  # 60 s at the 0.5 s poll interval
 FLIGHT_KEEP_FILES = 10
 
+# =========================
+# Settings file
+#
+# The same config.ini keys on every platform. load_settings() below gives the same
+# answer for a file as hwinfo_12vhpwr_guard.load_config() does, key for key, which
+# tests/test_settings_parity.py pins. The Windows guard keeps its own copy of these
+# few constants for now; the parity test is what stops the two from drifting.
+#
+# Private on purpose: every public constant here must also be the very same object
+# on the Windows module (test_a2 checks that), and these are not re-exported there.
+# =========================
+# Which sensor source to use. Only "auto" and "astral" mean anything on Linux, where
+# the direct sensor is the only source; the value is still parsed the same way.
+_DEFAULT_SENSOR_BACKEND = "auto"
+_VALID_SENSOR_BACKENDS = ("auto", "astral", "hwinfo")
+
+# Self-restart after the direct sensor has been gone this long (0 turns it off).
+_DEFAULT_SENSOR_LOSS_RESTART_SECONDS = 300.0
+
+# The on/off flag lives in the file under "advisories"; the dict key spells out
+# what the value means.
+_ADVISORIES_CONFIG_KEY = "advisories"
+
+_TRUE_WORDS = ("on", "true", "yes", "1")
+_FALSE_WORDS = ("off", "false", "no", "0")
+
 
 # =========================
 # Notices
@@ -204,6 +232,113 @@ Notifier = Callable[[Notice], None]
 
 def no_notify(_notice: Notice) -> None:
     """The notifier used when none is passed in."""
+
+
+# =========================
+# Settings
+# =========================
+def default_settings() -> dict:
+    """Every setting at its default, in the shape load_settings() returns."""
+    settings = {
+        "threshold_amps": DEFAULT_THRESHOLD_AMPS,
+        "sustained_seconds_required": DEFAULT_SUSTAINED_SECONDS_REQUIRED,
+        "sensor_backend": _DEFAULT_SENSOR_BACKEND,
+        "response_mode": DEFAULT_RESPONSE_MODE,
+        "sensor_loss_restart_seconds": _DEFAULT_SENSOR_LOSS_RESTART_SECONDS,
+    }
+    settings.update(DEFAULT_TIER_VALUES)
+    settings.update(DEFAULT_ADVISORY_VALUES)
+    return settings
+
+
+def _config_bool(config, key: str, fallback: bool) -> bool:
+    """Read an on/off style key. Anything unrecognised keeps the default."""
+    raw = config.get("Settings", key, fallback=None)
+    if raw is None:
+        return fallback
+    word = str(raw).strip().lower()
+    if word in _TRUE_WORDS:
+        return True
+    if word in _FALSE_WORDS:
+        return False
+    return fallback
+
+
+def load_settings(path: Optional[str]) -> dict:
+    """Read config.ini at path. Never raises; a missing or unusable file means defaults.
+
+    The rules are the Windows guard's load_config(), deliberately including its quirks,
+    because both platforms have to read one file the same way:
+      - a threshold or sustained window that is not positive, or any value in the file
+        that is not a number where a number belongs, throws the whole file away;
+      - an unknown sensor_backend or response_mode falls back to its default alone;
+      - a tier or advisory number that is not positive falls back to its default alone;
+      - advisories takes on/off words, anything else keeps the default;
+      - sensor_loss_restart_seconds keeps 0 (the feature off) and rejects negatives.
+    """
+    defaults = default_settings()
+    if not path or not os.path.exists(path):
+        return defaults
+
+    try:
+        config = configparser.ConfigParser()
+        config.read(path, encoding="utf-8")
+
+        threshold = config.getfloat("Settings", "threshold_amps",
+                                    fallback=DEFAULT_THRESHOLD_AMPS)
+        sustained = config.getfloat("Settings", "sustained_seconds_required",
+                                    fallback=DEFAULT_SUSTAINED_SECONDS_REQUIRED)
+        backend = config.get("Settings", "sensor_backend",
+                             fallback=_DEFAULT_SENSOR_BACKEND).strip().lower()
+        mode = config.get("Settings", "response_mode",
+                          fallback=DEFAULT_RESPONSE_MODE).strip().lower()
+
+        # nan slips past a <= 0 test and inf is not a threshold: either would
+        # silently switch tier 1 off, so both count as invalid like a negative.
+        if (not (math.isfinite(threshold) and math.isfinite(sustained))
+                or threshold <= 0 or sustained <= 0):
+            raise ValueError("Values must be positive")
+        if backend not in _VALID_SENSOR_BACKENDS:
+            backend = _DEFAULT_SENSOR_BACKEND
+        if mode not in VALID_RESPONSE_MODES:
+            mode = DEFAULT_RESPONSE_MODE
+
+        loaded = {
+            "threshold_amps": threshold,
+            "sustained_seconds_required": sustained,
+            "sensor_backend": backend,
+            "response_mode": mode,
+        }
+
+        # One bad tier value falls back to that default on its own; the rest of the
+        # file is still worth honouring.
+        for key, fallback in DEFAULT_TIER_VALUES.items():
+            value = config.getfloat("Settings", key, fallback=fallback)
+            loaded[key] = value if math.isfinite(value) and value > 0 else fallback
+
+        # Same rule for the advisory numbers, and the on/off flag on top.
+        for key, fallback in DEFAULT_ADVISORY_VALUES.items():
+            if key == "advisories_enabled":
+                continue
+            value = config.getfloat("Settings", key, fallback=fallback)
+            loaded[key] = value if math.isfinite(value) and value > 0 else fallback
+        loaded["advisories_enabled"] = _config_bool(
+            config, _ADVISORIES_CONFIG_KEY, DEFAULT_ADVISORIES_ENABLED
+        )
+
+        # 0 is a real value here (the feature switched off), so the "positive or fall
+        # back" rule above would silently turn it back on. Only a negative is nonsense.
+        restart_after = config.getfloat(
+            "Settings", "sensor_loss_restart_seconds",
+            fallback=_DEFAULT_SENSOR_LOSS_RESTART_SECONDS,
+        )
+        loaded["sensor_loss_restart_seconds"] = (
+            restart_after if math.isfinite(restart_after) and restart_after >= 0
+            else _DEFAULT_SENSOR_LOSS_RESTART_SECONDS
+        )
+        return loaded
+    except Exception:
+        return defaults
 
 
 class FlightRecorder:
