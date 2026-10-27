@@ -175,11 +175,15 @@ RESUME_GRACE_SEC = 5.0
 # nothing inside this process ever gets it back: the PR #1 experiment logged 131
 # reconnect attempts in a row, all of them failed, and the guard sat blind until
 # someone restarted the task by hand. A fresh process gets a fresh driver session,
-# so after this long with no source at all the guard exits with a non-zero code and
-# lets Task Scheduler (RestartCount 999, one minute apart) start it again. Set 0 to
-# turn the whole thing off and keep waiting instead.
+# so after this long with no source at all the guard exits with RESTART_EXIT_CODE and
+# the supervisor (see "Supervisor" near the end of this file) starts it again. Set 0
+# to turn the whole thing off and keep waiting instead.
 # =========================
 DEFAULT_SENSOR_LOSS_RESTART_SECONDS = 300.0
+# The guard's own "start me again" exit code, distinct from the 1 a Python crash
+# exits with, so the supervisor can tell a planned restart from an unplanned one.
+# 75 is EX_TEMPFAIL from sysexits.h: a temporary failure, try again.
+RESTART_EXIT_CODE = 75
 SENSOR_LOSS_RESTART_SEC = DEFAULT_SENSOR_LOSS_RESTART_SECONDS
 
 # How long the loop waits between reconnect attempts once it has no source. Named
@@ -242,7 +246,7 @@ PAUSE_REMINDER_EVERY_SEC = 1800.0
 
 # Shown in the tray menu and logged at startup so "which version are you running"
 # is answerable without digging through files.
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.4.0"
 
 # Event Viewer source name
 EVENT_SOURCE = "12VHPWR Guard"
@@ -1818,8 +1822,8 @@ def request_exit(code: int, stop_event: Optional[threading.Event] = None) -> Non
     end the thread and leave the tray running with nothing behind it. So the code goes
     into shared state, the loop is told to stop, and the tray icon is stopped, which
     returns main() from icon.run() and lets it exit with the code. A non-zero code is
-    the whole point of the self-restart: Task Scheduler only restarts a task whose
-    process failed.
+    the whole point of the self-restart: the supervisor restarts the guard on any exit
+    that is not 0.
     """
     set_state(exit_code=int(code))
     if stop_event is not None:
@@ -2150,8 +2154,8 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
         A driver update kills the NVAPI session the direct backend holds and nothing
         in this process ever gets it back (PR #1: 131 failed reconnects in a row, and
         a blind guard until the task was restarted by hand). A new process gets a new
-        driver session, so past the window this exits non-zero and hands the problem
-        to Task Scheduler, which is the only thing here that can start the guard again.
+        driver session, so past the window this exits with RESTART_EXIT_CODE and the
+        supervisor process starts the guard again.
 
         Only for a session where the direct backend actually connected at some point.
         An unsupported card, or a `sensor_backend = hwinfo` install, keeps waiting
@@ -2174,7 +2178,7 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
             eventlog_write(win32con.EVENTLOG_ERROR_TYPE, 9002, msg)
         toast("12VHPWR Guard - restarting",
               f"No sensor for {_span_text(restart_after)}, restarting to recover it.")
-        request_exit(1, stop_event)
+        request_exit(RESTART_EXIT_CODE, stop_event)
         return True
 
     try:
@@ -3068,6 +3072,10 @@ def main():
     # Published before the tray starts, so the first setting the user changes is
     # already logged. The monitor thread below gets the same instance.
     LOGGER = logger
+    last_exit = os.environ.get(SUPERVISOR_LAST_EXIT_ENV)
+    if last_exit:
+        logger.warning(f"Restarted by the supervisor: the previous guard process exited "
+                       f"with code {last_exit}.")
     stop_event = threading.Event()
 
     # Create dialog service (dedicated Tk thread) before starting tray
@@ -3078,9 +3086,122 @@ def main():
 
     run_tray(stop_event)
 
-    # 0 for a stop the user asked for, which Task Scheduler leaves alone. 1 when the
-    # guard asked to be restarted, which is what makes the scheduler start it again.
+    # 0 for a stop the user asked for, which the supervisor leaves alone.
+    # RESTART_EXIT_CODE when the guard asked to be started again.
     sys.exit(pending_exit_code())
 
+# =========================
+# Supervisor
+# =========================
+# Task Scheduler's "restart on failure" only covers a task that fails to launch. A
+# guard that started and then died (a crash, a kill, or the self-restart above) is
+# never started again by it: measured on the rig 2026-10-28, the guard stayed down
+# with LastTaskResult 0xFFFFFFFF and RestartCount 999 configured. So the process the
+# task starts is a supervisor: it runs the real guard as a child and starts it again
+# whenever it exits with anything but 0.
+#
+# It does nothing else (no sensor, no GPU, no tray, no log file), so there is next to
+# nothing in it that can fail. It stays in this file so the scheduled task, the
+# installer and every existing install keep working unchanged.
+SUPERVISOR_CHILD_FLAG = "--child"
+# Runs the guard in this process with no supervisor, for debugging.
+NO_SUPERVISOR_FLAG = "--no-supervisor"
+# Tells a restarted guard why it is running, so its log says so.
+SUPERVISOR_LAST_EXIT_ENV = "TWELVEVHPWR_GUARD_LAST_EXIT"
+# Seconds before restarting after an unplanned exit, one step further per crash in a
+# row, so a guard that dies at startup cannot spin the CPU. A child that ran for
+# SUPERVISOR_STABLE_SEC before dying starts the sequence over.
+SUPERVISOR_BACKOFF_SEC = (5.0, 10.0, 20.0, 40.0, 60.0)
+SUPERVISOR_STABLE_SEC = 120.0
+# A planned restart already waited out its own window inside the guard.
+SUPERVISOR_PLANNED_DELAY_SEC = 2.0
+
+
+def _supervisor_command() -> List[str]:
+    return [sys.executable, os.path.abspath(__file__), SUPERVISOR_CHILD_FLAG]
+
+
+def _spawn_guard(cmd: List[str], env: dict):
+    # No creation flags: under pythonw there is no console to hide, and under
+    # python.exe the child shares the console so a developer still sees its output.
+    return subprocess.Popen(cmd, cwd=BASE_DIR, env=env)
+
+
+def _announce_restart(code: Optional[int], delay: float) -> None:
+    """Event Viewer, plus a toast when the exit was not one the guard planned."""
+    planned = code == RESTART_EXIT_CODE
+    if code is None:
+        msg = f"Could not start the guard process; trying again in {delay:g} s."
+    elif planned:
+        msg = (f"The guard asked to be restarted (exit code {code}); starting it again "
+               f"in {delay:g} s.")
+    else:
+        msg = (f"The guard process stopped unexpectedly (exit code {code}); starting "
+               f"it again in {delay:g} s.")
+    if HAVE_EVENTLOG:
+        etype = win32con.EVENTLOG_INFORMATION_TYPE if planned else win32con.EVENTLOG_WARNING_TYPE
+        eventlog_write(etype, 9003, msg)
+    if not planned:
+        # The guard's own self-restart already toasted; a crash has nobody else to say it.
+        toast("12VHPWR Guard - restarting", msg)
+
+
+def _guard_shutdown_pending() -> bool:
+    return os.path.exists(LAST_SHUTDOWN_PATH)
+
+
+def supervise(spawn=_spawn_guard, sleep=time.sleep, clock=time.monotonic,
+              announce=_announce_restart, command=None,
+              shutdown_pending=_guard_shutdown_pending) -> int:
+    """Run the guard as a child until it exits with 0. Returns 0."""
+    cmd = command or _supervisor_command()
+    crashes_in_a_row = 0
+    last_exit: Optional[int] = None
+    while True:
+        env = dict(os.environ)
+        if last_exit is not None:
+            env[SUPERVISOR_LAST_EXIT_ENV] = str(last_exit)
+        started = clock()
+        try:
+            code = spawn(cmd, env).wait()
+        except KeyboardInterrupt:
+            # Ctrl-C in a console reaches the child too; nothing left to supervise.
+            return 0
+        except OSError:
+            code = None
+        if code == 0:
+            return 0
+        # The guard writes its shutdown note just before it shuts the machine down, and
+        # Windows then ends it with a non-zero code. A guard restarted in that gap would
+        # announce and delete the note mid-shutdown, and the next boot would never warn.
+        if shutdown_pending():
+            return 0
+
+        if code == RESTART_EXIT_CODE:
+            delay = SUPERVISOR_PLANNED_DELAY_SEC
+            crashes_in_a_row = 0
+        else:
+            if code is not None and clock() - started >= SUPERVISOR_STABLE_SEC:
+                crashes_in_a_row = 0
+            delay = SUPERVISOR_BACKOFF_SEC[min(crashes_in_a_row, len(SUPERVISOR_BACKOFF_SEC) - 1)]
+            crashes_in_a_row += 1
+        last_exit = code if code is not None else -1
+        try:
+            announce(code, delay)
+        except Exception:
+            pass
+        try:
+            sleep(delay)
+        except KeyboardInterrupt:
+            return 0
+
+
+def entry(argv: List[str]) -> int:
+    if SUPERVISOR_CHILD_FLAG in argv or NO_SUPERVISOR_FLAG in argv:
+        main()
+        return 0
+    return supervise()
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(entry(sys.argv[1:]))

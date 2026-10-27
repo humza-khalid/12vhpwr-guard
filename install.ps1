@@ -155,13 +155,16 @@ if ($AllUsers) {
 # IgnoreNew also covers a second account logging on while the first is still signed
 # in: the guard already running keeps protecting the card, and the guard's global
 # single-instance mutex backs this up for a copy started by hand.
-# RestartCount is deliberately high: a watchdog that gives up after a few crashes
-# stops protecting the card exactly when something is already going wrong.
+# RestartCount only covers a launch that fails: Task Scheduler never restarts a process
+# that started and then exited (measured on the rig 2026-10-28). Crashes and kills are the
+# job of the supervisor inside hwinfo_12vhpwr_guard.py. Kept high anyway: a watchdog that
+# gives up after a few failures stops protecting the card exactly when something is
+# already going wrong.
 $Settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
     -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
 
 # Without this the task defaults to a 72-hour limit and Task Scheduler kills the guard
-# after 3 days of uptime. A time-limit stop is not a "failure", so RestartCount never fires.
+# after 3 days of uptime, and a time-limit stop is not something anything restarts.
 $Settings.ExecutionTimeLimit = "PT0S"
 
 Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Principal $Principal -Settings $Settings | Out-Null

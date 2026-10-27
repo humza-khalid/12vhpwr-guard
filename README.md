@@ -58,11 +58,11 @@ This tool adds a last-line, OS-level safety net by:
 - Quiet rotating file logs
 - **Detects sensor loss** (HWiNFO exit/crash/freeze, or I2C failure) and auto-reconnects; never reports OK on stale data
 - **Recovers from a driver update**: if the card's sensor path dies and stays dead for 5
-  minutes, the guard restarts itself through Task Scheduler and comes back with a fresh driver
-  session
+  minutes, the guard restarts itself and comes back with a fresh driver session
 - **Resets its timer across sleep/resume** instead of trusting a stale reading
 - **Single-instance guard** (one guard per PC, even with several Windows accounts signed in; a second copy exits instead of double-monitoring)
-- Uses **Task Scheduler as watchdog**
+- **Restarts itself within seconds if it crashes or is killed** (a small built-in supervisor;
+  Task Scheduler starts it at logon)
 
 ---
 
@@ -171,9 +171,9 @@ rig that was 131 reconnect attempts in a row, all failed, with the card unprotec
 scheduled task was restarted by hand. A new process gets a new driver session, so since v1.4
 the guard does that itself: if it has **no source at all for 5 minutes** after having read the
 direct sensor earlier in that session, it logs the reason, writes event **9002**, toasts, and
-exits with a failure code. Task Scheduler is configured to restart a failed run (999 times, one
-minute apart), so the guard is back within about a minute with a clean session, and the log
-shows a fresh "Starting" line.
+exits with its restart code. The guard's supervisor (below) starts it again two seconds later
+with a clean session, and the log shows a fresh "Starting" line followed by "Restarted by the
+supervisor".
 
 Two cases deliberately never restart:
 
@@ -184,9 +184,24 @@ Two cases deliberately never restart:
   same way.
 
 Time spent **paused** does not count either: a paused guard is not trying to reconnect, and the
-clock starts over when you resume. The restart is what Task Scheduler makes of a failed run, so
-a guard started by hand from a console has nothing to bring it back and will simply exit. The
-window is `sensor_loss_restart_seconds` in `config.ini`, and `0` turns the whole behaviour off.
+clock starts over when you resume. The window is `sensor_loss_restart_seconds` in
+`config.ini`, and `0` turns the whole behaviour off.
+
+### If the guard crashes or is killed
+
+Task Scheduler's "restart on failure" only covers a task that fails to start. A guard that
+started and then died was never brought back by it: on this project's rig in October 2026 the
+guard was killed and stayed down, with 999 restarts configured. So since v1.4 the process the
+task starts is a small supervisor that runs the real guard as a child process and does nothing
+else. If the guard exits for any reason other than you choosing **Exit** from the tray, the
+supervisor starts it again: after 2 seconds for the planned self-restart above, otherwise after
+5 seconds, backing off to a minute if it keeps dying so a startup problem cannot spin the CPU.
+A crash or kill also toasts and writes event **9003**. The one exit it never restarts is the
+guard's own emergency shutdown: the shutdown note is already written, and a restarted guard would
+read it out and delete it before the next boot could warn you.
+
+That is why Task Manager shows more `pythonw.exe` processes than before. Running the script
+with `--no-supervisor` starts the guard without it, for debugging; nothing restarts that one.
 
 ---
 
@@ -422,7 +437,8 @@ The easiest way to install 12VHPWR Guard is using the included installer.
      - Runs at logon of your account, or of every account if you answer `y` to the
        all-accounts question
      - Starts the guard with `pythonw.exe` (no console window)
-     - Restarts automatically on failure (up to 999 times, 1-minute interval)
+     - Restarts the guard within seconds if it crashes or is killed (the built-in
+       supervisor), and retries a launch that fails up to 999 times, 1 minute apart
      - Runs indefinitely: the default 72-hour Task Scheduler execution limit is disabled,
        and battery-power settings will not stop it
 
@@ -540,7 +556,8 @@ If you prefer not to use the installer or need a custom setup:
    - **Arguments:** `hwinfo_12vhpwr_guard.py`
    - **Start in:** project folder (e.g. `C:\12vhpwr_guard`)
    - **Trigger:** At log on  
-   - **Settings:** Restart on failure suggested, and set **"Stop the task if it runs longer
+   - **Settings:** Restart on failure suggested (it only covers a launch that fails; the
+     guard's own supervisor handles crashes), and set **"Stop the task if it runs longer
      than"** to **disabled**; the Task Scheduler default silently kills the guard after
      72 hours of uptime
 
@@ -634,7 +651,11 @@ the sensor-path check is **7003** (no current on any pin), all three warnings. *
 
 Event ID **9002** (error) is the self-restart after a long sensor loss, described under
 [When the sensor source goes away](#when-the-sensor-source-goes-away). It is followed by the
-usual **1003** stopped entry, and then a **1000** start from the run Task Scheduler brings up.
+usual **1003** stopped entry, and then a **1000** start from the run the supervisor brings up.
+
+Event ID **9003** is the supervisor starting the guard again: information after the planned
+self-restart, a warning after a crash or a kill. See
+[If the guard crashes or is killed](#if-the-guard-crashes-or-is-killed).
 
 ---
 
@@ -669,7 +690,7 @@ sensor_loss_restart_seconds = 300.0
 
 | Key | Meaning |
 |---|---|
-| `sensor_loss_restart_seconds` | How long the guard goes without any sensor source, after having read the direct sensor, before it exits so Task Scheduler restarts it. `0` turns the self-restart off and it waits instead |
+| `sensor_loss_restart_seconds` | How long the guard goes without any sensor source, after having read the direct sensor, before it exits so the supervisor restarts it. `0` turns the self-restart off and it waits instead |
 
 **Tier settings.** These are optional and only read at startup. Leave them out and the
 defaults below apply:
