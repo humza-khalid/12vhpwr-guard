@@ -40,6 +40,10 @@ This tool adds a last-line, OS-level safety net by:
   fault clears, including after a crash
 - **Tells you why**: after an emergency shutdown, the next start shows what happened and
   when, so a trip while you were away is not a mystery
+- **Warns about a dead or imbalanced pin** before it becomes dangerous, without touching the
+  GPU
+- **Never shows green when it cannot see the load**: pins carrying no current (slot power on a
+  BTF board, or a dead sensor block) turn the icon purple and say so, in every response mode
 - **Flight recorder**: the last minute of per-pin samples is saved to `logs/` whenever the
   guard acts, evidence for a bug report or an RMA claim
 - **Force-closes blocking apps** during shutdown so nothing can stall it (on by default; `SHUTDOWN_FORCE_CLOSE_APPS` in the source)
@@ -53,9 +57,12 @@ This tool adds a last-line, OS-level safety net by:
 - **Windows Event Viewer logging**
 - Quiet rotating file logs
 - **Detects sensor loss** (HWiNFO exit/crash/freeze, or I2C failure) and auto-reconnects; never reports OK on stale data
+- **Recovers from a driver update**: if the card's sensor path dies and stays dead for 5
+  minutes, the guard restarts itself and comes back with a fresh driver session
 - **Resets its timer across sleep/resume** instead of trusting a stale reading
 - **Single-instance guard** (one guard per PC, even with several Windows accounts signed in; a second copy exits instead of double-monitoring)
-- Uses **Task Scheduler as watchdog**
+- **Restarts itself within seconds if it crashes or is killed** (a small built-in supervisor;
+  Task Scheduler starts it at logon)
 
 ---
 
@@ -78,12 +85,17 @@ chip that measures each 12VHPWR pin individually. Recognized models (by PCI subs
 | `1043:8A5A` | ROG Astral RTX 5090 BTF OC (see BTF note) |
 | `1043:8A3C` | ROG Astral RTX 5090 BTF OC, second id revision of the same card (see BTF note) |
 | `1043:89DF` | ROG Astral RTX 5080 (non-OC) |
+| `1043:89FF` | ROG Astral RTX 5090, newer id revision (owner report, awaiting confirmation) |
 
 **BTF note:** the BTF card is supported when it draws power through the normal 16-pin cable
 in a standard motherboard, which is where its card-side sensors sit. Installed in an actual
 BTF motherboard (power through the GC-HPWR slot connector), the load bypasses those sensors:
 the guard would read near zero on every pin and could not protect anything. Do not rely on
-this tool for a GC-HPWR powered card.
+this tool for a GC-HPWR powered card. Since v1.4 the guard says so itself rather than leaving
+you to read this paragraph: within a minute of starting on a slot-powered card the tray icon
+turns purple and the tooltip reads "NOT PROTECTED", with the reason in the log and in Event
+Viewer. That check runs in every response mode and cannot be switched off, because it is not
+a warning about your cable, it is the guard telling you it cannot see the load.
 
 Have an Astral variant that is not in this table (the guard sits purple)? Run
 `nvidia-smi --query-gpu=name,pci.sub_device_id --format=csv` and open an issue with the
@@ -93,7 +105,8 @@ No other GPU exposes per-pin current, including non-Astral RTX 5080/5090 cards. 
 hardware the guard cannot protect anything and will say so rather than pretend to work.
 
 ### OS
-- Windows 10 / 11
+- Windows 10 / 11 for the guard itself. On Linux only a read-only sensor proof of concept
+  exists so far, see [Reading the card on Linux](#reading-the-card-on-linux-toolsastral_poc_linuxpy).
 
 ### Software
 - Python 3.10+
@@ -145,6 +158,55 @@ sensor_backend = auto
   switch if the direct path ever misbehaves.
 
 Changing this requires a restart of the guard.
+
+### When the sensor source goes away
+
+If the source dies (HWiNFO exits or freezes, or an I2C read fails hard enough), the guard drops
+the connection rather than trusting the last values it saw, turns the tray icon purple, and
+tries to connect again every few seconds. Most of the time that works: restart HWiNFO and the
+next attempt picks it up.
+
+One case never works. A driver update, or a driver crash, takes the session the direct backend
+holds with it, and nothing inside the running process ever gets it back. On this project's own
+rig that was 131 reconnect attempts in a row, all failed, with the card unprotected until the
+scheduled task was restarted by hand. A new process gets a new driver session, so since v1.4
+the guard does that itself: if it has **no source at all for 5 minutes** after having read the
+direct sensor earlier in that session, it logs the reason, writes event **9002**, toasts, and
+exits with its restart code. The guard's supervisor (below) starts it again two seconds later
+with a clean session, and the log shows a fresh "Starting" line followed by "Restarted by the
+supervisor".
+
+Two cases deliberately never restart:
+
+- **An HWiNFO-only session.** If the direct sensor was never the source, closing HWiNFO is a
+  normal thing to do and restarting over it would be a loop. The guard waits purple, as before.
+- **A session that never connected at all.** An unsupported card, or `sensor_backend = hwinfo`
+  with HWiNFO not running, has no direct session to recover, so a restart would only fail the
+  same way.
+
+Time spent **paused** does not count either: a paused guard is not trying to reconnect, and the
+clock starts over when you resume. The window is `sensor_loss_restart_seconds` in
+`config.ini`, and `0` turns the whole behaviour off.
+
+### If the guard crashes or is killed
+
+Task Scheduler's "restart on failure" only covers a task that fails to start. A guard that
+started and then died was never brought back by it: on this project's rig in October 2026 the
+guard was killed and stayed down, with 999 restarts configured. So since v1.4 the process the
+task starts is a small supervisor that runs the real guard as a child process and does nothing
+else. If the guard exits for any reason other than you choosing **Exit** from the tray, the
+supervisor starts it again: after 2 seconds for the planned self-restart above, otherwise after
+5 seconds, backing off to a minute if it keeps dying so a startup problem cannot spin the CPU.
+A crash or kill also toasts and writes event **9003**. The one exit it never restarts is the
+guard's own emergency shutdown: the shutdown note is already written, and a restarted guard would
+read it out and delete it before the next boot could warn you.
+
+It works the other way too: the guard watches its supervisor and stops within a second once the
+supervisor is gone, so stopping the scheduled task (which the installer and uninstaller both do)
+still stops everything.
+
+That is why Task Manager shows more `pythonw.exe` processes than before. Running the script
+with `--no-supervisor` starts the guard without it, for debugging; nothing restarts that one.
 
 ---
 
@@ -246,6 +308,81 @@ silently pretends to have a capability it does not have.
 
 ---
 
+## What it warns about
+
+Everything above acts on **absolute** per-pin current, because that is what melts a connector.
+That leaves one blind spot, and a community member put real numbers on it in PR #2: at a 540 W
+power limit, a connector with **one open pin** puts 44.8 A through the five that are left, so
+each carries 8.96 A. That is under the 9.5 A tier 1 trip. Nothing is over threshold, the guard
+stays green, and the connector is running on five wires with a hot spot where the sixth should
+be. Invisible to a threshold, obvious in the spread.
+
+So the guard also watches the **shape** of the six readings, and says something when it looks
+wrong:
+
+- **Dead pin** - one pin reads at or below **0.5 A** while the other five average **3.0 A** or
+  more. That pin, or its contact, is open. If more than one pin is near zero, the message names
+  the quietest and says how many.
+- **Imbalance** - the gap between the busiest and the quietest pin is **3.0 A** or more, with
+  the busiest at **5.0 A** or more, and no dead pin. Uneven contact resistance puts the heat on
+  the busiest pin. For scale, a healthy Astral in this project's own logs runs a 0.7 A spread at
+  7.5 A per pin, so 3.0 A has real margin.
+
+Both only apply while the connector is actually carrying something: the six pins have to total
+at least **18 A** (about 215 W) before either rule can start, so idle noise cannot trip them. A
+condition has to hold for **10 s** before the first warning, then repeats at most every
+**10 minutes** while it lasts, and logs one "cleared" line once it has been gone for a minute.
+
+There is a third thing it watches, and this one is about the guard rather than the cable:
+
+- **No current on any pin** - all six pins read **0.1 A or less** for a full **minute** while
+  the guard is connected. Nothing is flowing through the connector it is watching, so nothing
+  above this line means anything: the readings would sit at a comfortable zero no matter what
+  the card was doing. That is what a BTF card powered through the GC-HPWR slot looks like (see
+  the BTF note under [Hardware Compatibility](#hardware-compatibility)), and it is also what a
+  dead or unpowered sensor block looks like. Either way the answer is the same, so the guard
+  stops showing green: the icon goes **purple**, which has always meant "cannot protect", and
+  the tooltip reads "NOT PROTECTED". It goes back to green a minute after the pins carry
+  current again. A cabled Astral cannot look like this, because it idles at roughly 0.5 to
+  1.0 A per pin: it takes nearly everything through the 16-pin and almost nothing from the
+  slot. In tiered mode the guard also compares the pins against the board power the card
+  reports (above **150 W**, pins adding up to less than a **quarter** of what that power
+  implies, for **30 s**), which catches the partial case where slot and cable are both
+  connected. That message names both numbers.
+
+  Unlike the two above, **`advisories = off` does not silence this one**, and neither does
+  shutdown-only mode. It is not an opinion about your hardware that you might not want; it is
+  the guard admitting it cannot see the load, and a tool that hides that is worse than no tool.
+
+**An advisory never does anything to your machine.** It is a toast, a log line, an Event Viewer
+entry and a tooltip suffix, and that is all. It never limits the GPU, never shuts down, and
+never touches the tiers above. The guard has not acted, because there is nothing here for it to
+act on yet. The one thing any of this changes is the icon colour, and only for the no-current
+case, where green would be a lie.
+
+At the **first** warning of an episode the guard writes `logs/flight_*_advisory.csv`, the last
+minute of per-pin readings. That file is the evidence, and the fault may not repeat on demand:
+reseat the cable at both ends, look at the pins in the connector for discolouration or a
+retracted terminal, and keep the file if you end up filing an RMA.
+
+Advisories are configured in `config.ini` and are on by default:
+
+```ini
+[Settings]
+advisories = on
+advisory_load_amps = 18.0
+dead_pin_max_amps = 0.5
+imbalance_spread_amps = 3.0
+advisory_sustain_seconds = 10.0
+advisory_repeat_seconds = 600.0
+```
+
+Set `advisories = off` to silence the dead-pin and imbalance warnings completely. The
+sensor-path check is not one of them and keeps running either way. Like the tier settings,
+these are read at startup only, and the tray menu never touches them.
+
+---
+
 ## HWiNFO Configuration
 
 Only needed if you use the `hwinfo` backend (or want HWiNFO running alongside for its own sake).
@@ -305,7 +442,8 @@ The easiest way to install 12VHPWR Guard is using the included installer.
      - Runs at logon of your account, or of every account if you answer `y` to the
        all-accounts question
      - Starts the guard with `pythonw.exe` (no console window)
-     - Restarts automatically on failure (up to 999 times, 1-minute interval)
+     - Restarts the guard within seconds if it crashes or is killed (the built-in
+       supervisor), and retries a launch that fails up to 999 times, 1 minute apart
      - Runs indefinitely: the default 72-hour Task Scheduler execution limit is disabled,
        and battery-power settings will not stop it
 
@@ -423,7 +561,8 @@ If you prefer not to use the installer or need a custom setup:
    - **Arguments:** `hwinfo_12vhpwr_guard.py`
    - **Start in:** project folder (e.g. `C:\12vhpwr_guard`)
    - **Trigger:** At log on  
-   - **Settings:** Restart on failure suggested, and set **"Stop the task if it runs longer
+   - **Settings:** Restart on failure suggested (it only covers a launch that fails; the
+     guard's own supervisor handles crashes), and set **"Stop the task if it runs longer
      than"** to **disabled**; the Task Scheduler default silently kills the guard after
      72 hours of uptime
 
@@ -448,15 +587,19 @@ If you prefer not to use the installer or need a custom setup:
 | Amber | Over threshold |
 | Orange | GPU limited, waiting for the current to clear |
 | Red | Shutdown triggered |
-| Purple | No sensor source / waiting to reconnect (not monitoring) |
+| Purple | Cannot protect: no sensor source, or the pins carry no current |
 | Gray | Source connected, but per-pin sensors not found |
 | Blue | Paused |
 
-**Purple vs. Gray:** purple means the guard currently has **no data source**: no supported
-Astral card could be read directly, and HWiNFO shared memory is not available (not running,
-exited, or frozen). Gray means a source is connected but the six per-pin sensors are missing;
-with the `hwinfo` backend that usually means renamed or disabled sensors, so check the names
-under [HWiNFO Configuration](#hwinfo-configuration). In both cases **no protection is active**.
+**Purple vs. Gray:** purple means the guard cannot protect the card, for one of two reasons.
+Either it has **no data source** (no supported Astral card could be read directly and HWiNFO
+shared memory is not available: not running, exited, or frozen), or it has readings that carry
+**no current at all**, which is the sensor-path check under
+[What it warns about](#what-it-warns-about). The tooltip says which: "Waiting for pin sensors"
+against "NOT PROTECTED". Gray means a source is connected but the six per-pin sensors are
+missing; with the `hwinfo` backend that usually means renamed or disabled sensors, so check the
+names under [HWiNFO Configuration](#hwinfo-configuration). In all of these cases **no
+protection is active**.
 
 Hovering the icon shows the current status, the highest pin current, and the active data
 source (`... | direct` or `... | HWiNFO`). While the GPU is limited the tooltip reads
@@ -503,6 +646,22 @@ Event Viewer > Windows Logs > Application
 Source: 12VHPWR Guard
 ```
 
+Every setting you change from the tray is written to the log and to Event Viewer (event ID
+1010) with its old and new value, so a trip can be read against the settings that were live.
+
+The warn-only pin advisories are event IDs **7001** (imbalance) and **7002** (dead pin), and
+the sensor-path check is **7003** (no current on any pin), all three warnings. **7004**
+(cleared) is the information entry that ends any of them. See
+[What it warns about](#what-it-warns-about).
+
+Event ID **9002** (error) is the self-restart after a long sensor loss, described under
+[When the sensor source goes away](#when-the-sensor-source-goes-away). It is followed by the
+usual **1003** stopped entry, and then a **1000** start from the run the supervisor brings up.
+
+Event ID **9003** is the supervisor starting the guard again: information after the planned
+self-restart, a warning after a crash or a kill. See
+[If the guard crashes or is killed](#if-the-guard-crashes-or-is-killed).
+
 ---
 
 ## Configuration
@@ -527,6 +686,17 @@ preserves whatever value you set here.
 `response_mode` is `tiered` or `shutdown_only`, described under
 [How it responds](#how-it-responds). It is the one setting the tray menu changes at runtime.
 
+**Self-restart.** Optional, read at startup only, described under
+[When the sensor source goes away](#when-the-sensor-source-goes-away):
+
+```ini
+sensor_loss_restart_seconds = 300.0
+```
+
+| Key | Meaning |
+|---|---|
+| `sensor_loss_restart_seconds` | How long the guard goes without any sensor source, after having read the direct sensor, before it exits so the supervisor restarts it. `0` turns the self-restart off and it waits instead |
+
 **Tier settings.** These are optional and only read at startup. Leave them out and the
 defaults below apply:
 
@@ -548,6 +718,27 @@ retrigger_window_seconds = 600.0
 | `mitigation_clear_seconds` | How long all pins must stay clear before the limit lifts |
 | `mitigation_min_hold_seconds` | Minimum time the limit stays on regardless of how fast the current falls |
 | `retrigger_window_seconds` | A tier firing again this soon after a release is a persistent fault, and shuts down |
+
+**Advisory settings.** Also optional, also read at startup only, described under
+[What it warns about](#what-it-warns-about). Leave them out and the defaults below apply:
+
+```ini
+advisories = on
+advisory_load_amps = 18.0
+dead_pin_max_amps = 0.5
+imbalance_spread_amps = 3.0
+advisory_sustain_seconds = 10.0
+advisory_repeat_seconds = 600.0
+```
+
+| Key | Meaning |
+|---|---|
+| `advisories` | `on` or `off`. Off silences the warn-only advisories completely |
+| `advisory_load_amps` | The six pins must total at least this before any advisory can start |
+| `dead_pin_max_amps` | A pin at or below this, while the others average 3.0 A or more, is an open pin |
+| `imbalance_spread_amps` | Busiest minus quietest pin at or above this (with the busiest at 5.0 A or more) is an imbalance |
+| `advisory_sustain_seconds` | How long a condition must hold before the first warning |
+| `advisory_repeat_seconds` | How often a warning repeats while the condition lasts |
 
 ### Default Safety Settings
 
@@ -605,6 +796,33 @@ The protocol (chip address, register layout, pin ordering, NVAPI struct) is docu
 header of `astral_i2c.py`, with the two independent sources it was verified against. All access
 is **read-only**; the module deliberately does not bind NVAPI's I2C write function.
 
+### Reading the card on Linux (`tools/astral_poc_linux.py`)
+
+The guard itself is Windows only, but the sensor path is not. This read-only proof of
+concept reads the same IT8915 block over the kernel's `/dev/i2c-N` interface, no NVAPI and
+no HWiNFO, and prints the six pins once a second. It finds the card through sysfs, checks
+the subsystem id against the same allowlist, and probes only the GPU's own I2C adapters.
+
+```
+sudo modprobe i2c-dev
+python3 tools/astral_poc_linux.py --list                      # candidate adapters, no root needed
+sudo python3 tools/astral_poc_linux.py --once --raw --volts   # one sample plus the raw bytes
+sudo python3 tools/astral_poc_linux.py                        # 1 Hz table, Ctrl-C to stop
+```
+
+Verified 2026-09-07 on Linux Mint (kernel 7.0, driver 610.43) with a ROG Astral RTX 5090 OC:
+the chip answers on "NVIDIA i2c adapter 1" at address 0x2B and reads about 11.95 V and 0.5 to
+0.6 A per pin at idle, the same numbers Windows shows. One quirk worth knowing if you write
+your own reader: on the NVIDIA adapters a plain write-then-read transaction returns all zeros
+silently, while the SMBus "I2C block data" read works, which is what the tool uses. That
+finding comes from the astral-hwmon project, which reads the same chip from a kernel driver.
+Do not scan the GPU bus with `i2cdetect -y`; its default probe writes to every address.
+
+The tool guards nothing on its own. A Linux daemon built on this path is planned; until then
+astral-hwmon offers a hwmon driver with a report-only guard and a poweroff service example.
+All access here is **read-only**: the register pointer is the only byte the tool ever puts on
+the bus, the device is opened read-only, and a test bans every write path.
+
 ### Testing the GPU slowdown (`tools/mitigation_poc.py`)
 
 Shows what the guard can do to the card, and proves the round trip puts everything back:
@@ -648,6 +866,18 @@ unset (the normal case) the guard reads the real `Global\HWiNFO_SENS_SM2` block.
 **Warning:** driving emulator values above the threshold for longer than the sustained window
 will shut the machine down for real. Raise `sustained_seconds_required` in `config.ini` while
 testing.
+
+### Running the tests
+
+```
+python -m pip install pytest
+python -m pytest -q tests
+```
+
+Windows only, since the guard imports `ctypes.wintypes`. The suite fakes the sensor and the
+GPU and stubs the shutdown, so it cannot power the machine off or touch the card, and it
+writes nothing outside a temporary directory. The rig end-to-end script is separate and is not
+in this repo: it drives the real NVML mitigation on a real Astral card and needs the hardware.
 
 ---
 

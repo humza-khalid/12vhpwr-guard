@@ -13,7 +13,7 @@ import queue
 import xml.etree.ElementTree as ET
 from collections import deque
 from logging.handlers import RotatingFileHandler
-from typing import List, Tuple, Optional
+from typing import List, NamedTuple, Tuple, Optional
 
 # =========================
 # CONFIG
@@ -82,6 +82,81 @@ DEFAULT_TIER_VALUES = {
 TIER_VALUES = dict(DEFAULT_TIER_VALUES)
 RESPONSE_MODE = DEFAULT_RESPONSE_MODE
 
+# =========================
+# Pin advisories (v1.4, warn only)
+#
+# The tiers above act on absolute per-pin current, which is what melts a connector.
+# That leaves them blind to a fault which lowers every reading: at a 540 W limit one
+# open pin puts 44.8 A through the surviving five, 8.96 A each, under the 9.5 A trip.
+# Nothing is over threshold and the connector is in trouble. The advisories read the
+# spread between the pins instead, and only ever talk: they never limit the GPU and
+# never shut anything down.
+# =========================
+DEFAULT_ADVISORIES_ENABLED = True
+
+# About 215 W through the connector. Below it the numbers are too small to tell a
+# fault from sensor noise, so nothing can start.
+DEFAULT_ADVISORY_LOAD_AMPS = 18.0
+DEFAULT_DEAD_PIN_MAX_AMPS = 0.5
+DEFAULT_IMBALANCE_SPREAD_AMPS = 3.0
+DEFAULT_ADVISORY_SUSTAIN_SECONDS = 10.0
+DEFAULT_ADVISORY_REPEAT_SECONDS = 600.0
+
+# Not config keys: these qualify a rule rather than tune it. The others have to be
+# carrying real current before one quiet pin means anything, a spread only matters
+# once the busiest pin is working, and a condition that has been gone for a minute
+# is over.
+DEAD_PIN_OTHERS_MIN_AMPS = 3.0
+IMBALANCE_MIN_MAX_AMPS = 5.0
+ADVISORY_CLEAR_SEC = 60.0
+
+# =========================
+# Sensor-path check (v1.4)
+#
+# A BTF card in an actual BTF motherboard is powered through the GC-HPWR slot, so
+# nothing at all flows through the 16-pin cable and the card-side pin sensors read
+# zero however hard the GPU is working. Every rule above would then be measuring a
+# wire that carries no current, and green would be a lie. A dead or unpowered sensor
+# block produces the same readings and deserves the same answer, so the check is
+# about what the sensors report, not about why.
+#
+# Not config keys either: a connector that is carrying nothing is not a tuning
+# question, and there is no number here a user could usefully move.
+# =========================
+# Below this a pin is carrying nothing. A cabled Astral idles at roughly 0.5 to 1.0 A
+# per pin, because the card takes nearly everything through the 16-pin and almost
+# nothing from the slot, so a cabled card cannot look like this.
+NO_CURRENT_AMPS = 0.1
+NO_CURRENT_SUSTAIN_SEC = 60.0
+
+# The optional half of the check (tiered mode only, where NVML is already bound): the
+# card reports real board power while the pins do not add up to anything like it.
+# The PCIe slot supplies at most 75 W, so at 150 W at least 75 W has to cross the
+# connector, which is 6.25 A at 12 V, while 25 % of the current implied by 150 W is
+# only 3.1 A. A correctly sensed cable cannot get under the ratio, so the margin is
+# wide in the direction that matters (no false alarm on a healthy card).
+MISMATCH_MIN_WATTS = 150.0
+MISMATCH_RATIO = 0.25
+MISMATCH_SUSTAIN_SEC = 30.0
+
+# Event Viewer ids for the three kinds the advisor can raise. All three are warnings;
+# the "cleared" line that ends any of them is 7004, information.
+ADVISORY_EVENT_IDS = {"imbalance": 7001, "dead_pin": 7002, "no_current": 7003}
+
+DEFAULT_ADVISORY_VALUES = {
+    "advisories_enabled": DEFAULT_ADVISORIES_ENABLED,
+    "advisory_load_amps": DEFAULT_ADVISORY_LOAD_AMPS,
+    "dead_pin_max_amps": DEFAULT_DEAD_PIN_MAX_AMPS,
+    "imbalance_spread_amps": DEFAULT_IMBALANCE_SPREAD_AMPS,
+    "advisory_sustain_seconds": DEFAULT_ADVISORY_SUSTAIN_SECONDS,
+    "advisory_repeat_seconds": DEFAULT_ADVISORY_REPEAT_SECONDS,
+}
+ADVISORY_VALUES = dict(DEFAULT_ADVISORY_VALUES)
+
+# The on/off flag lives in the file under "advisories"; the dict key spells out
+# what the value means.
+ADVISORIES_CONFIG_KEY = "advisories"
+
 # Which sensor source to use: "auto" prefers the card's own chip and falls back to
 # HWiNFO; "astral" and "hwinfo" pin it to one. Set "hwinfo" to roll back the direct
 # backend without reinstalling.
@@ -92,6 +167,29 @@ SENSOR_BACKEND = DEFAULT_SENSOR_BACKEND
 # A gap this long between samples means suspend/resume or a severe stall, not a
 # measurement. Sustained timers are reset rather than trusted across it.
 RESUME_GRACE_SEC = 5.0
+
+# =========================
+# Self-restart after sensor loss (v1.4)
+#
+# A driver update takes the NVAPI session the direct backend holds with it, and
+# nothing inside this process ever gets it back: the PR #1 experiment logged 131
+# reconnect attempts in a row, all of them failed, and the guard sat blind until
+# someone restarted the task by hand. A fresh process gets a fresh driver session,
+# so after this long with no source at all the guard exits with RESTART_EXIT_CODE and
+# the supervisor (see "Supervisor" near the end of this file) starts it again. Set 0
+# to turn the whole thing off and keep waiting instead.
+# =========================
+DEFAULT_SENSOR_LOSS_RESTART_SECONDS = 300.0
+# The guard's own "start me again" exit code, distinct from the 1 a Python crash
+# exits with, so the supervisor can tell a planned restart from an unplanned one.
+# 75 is EX_TEMPFAIL from sysexits.h: a temporary failure, try again.
+RESTART_EXIT_CODE = 75
+SENSOR_LOSS_RESTART_SEC = DEFAULT_SENSOR_LOSS_RESTART_SECONDS
+
+# How long the loop waits between reconnect attempts once it has no source. Named
+# rather than left inline because it is also the cadence at which the restart clock
+# above gets looked at.
+RECONNECT_RETRY_SEC = 3.0
 
 # These will be loaded from config file or use defaults
 THRESHOLD_AMPS = DEFAULT_THRESHOLD_AMPS
@@ -120,6 +218,13 @@ LOG_PATH = os.path.join(LOG_DIR, "12vhpwr_guard.log")
 LOG_MAX_BYTES = 2 * 1024 * 1024
 LOG_BACKUP_COUNT = 5
 
+# The one logger, published by main() so the tray callbacks can write to the same
+# file the monitor thread does. They run on the tray thread and are handed no
+# logger of their own, and a setting the user changed has to be in the log before
+# the trip line that the new value caused. None until main() runs (and under
+# tests), so every use has to tolerate that.
+LOGGER: Optional[logging.Logger] = None
+
 # Config file
 CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
 
@@ -141,7 +246,7 @@ PAUSE_REMINDER_EVERY_SEC = 1800.0
 
 # Shown in the tray menu and logged at startup so "which version are you running"
 # is answerable without digging through files.
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.4.0"
 
 # Event Viewer source name
 EVENT_SOURCE = "12VHPWR Guard"
@@ -156,6 +261,21 @@ ERROR_ALREADY_EXISTS = 183
 # =========================
 # Config file management (INI format)
 # =========================
+_TRUE_WORDS = ("on", "true", "yes", "1")
+_FALSE_WORDS = ("off", "false", "no", "0")
+
+def _config_bool(config, key: str, fallback: bool) -> bool:
+    """Read an on/off style key. Anything unrecognised keeps the default."""
+    raw = config.get("Settings", key, fallback=None)
+    if raw is None:
+        return fallback
+    word = str(raw).strip().lower()
+    if word in _TRUE_WORDS:
+        return True
+    if word in _FALSE_WORDS:
+        return False
+    return fallback
+
 def load_config() -> dict:
     """
     Load configuration from config.ini file, return dict with values or defaults.
@@ -167,8 +287,10 @@ def load_config() -> dict:
         "sustained_seconds_required": DEFAULT_SUSTAINED_SECONDS_REQUIRED,
         "sensor_backend": DEFAULT_SENSOR_BACKEND,
         "response_mode": DEFAULT_RESPONSE_MODE,
+        "sensor_loss_restart_seconds": DEFAULT_SENSOR_LOSS_RESTART_SECONDS,
     }
     defaults.update(DEFAULT_TIER_VALUES)
+    defaults.update(DEFAULT_ADVISORY_VALUES)
 
     if not os.path.exists(CONFIG_PATH):
         return defaults
@@ -203,6 +325,27 @@ def load_config() -> dict:
         for key, fallback in DEFAULT_TIER_VALUES.items():
             value = config.getfloat("Settings", key, fallback=fallback)
             loaded[key] = value if value > 0 else fallback
+
+        # Same rule for the advisory numbers, and the on/off flag on top.
+        for key, fallback in DEFAULT_ADVISORY_VALUES.items():
+            if key == "advisories_enabled":
+                continue
+            value = config.getfloat("Settings", key, fallback=fallback)
+            loaded[key] = value if value > 0 else fallback
+        loaded["advisories_enabled"] = _config_bool(
+            config, ADVISORIES_CONFIG_KEY, DEFAULT_ADVISORIES_ENABLED
+        )
+
+        # Read on its own because 0 is a real value here (the feature switched off),
+        # so the "positive or fall back" rule the loops above use would silently
+        # turn it back on. Only a negative number is nonsense.
+        restart_after = config.getfloat(
+            "Settings", "sensor_loss_restart_seconds",
+            fallback=DEFAULT_SENSOR_LOSS_RESTART_SECONDS,
+        )
+        loaded["sensor_loss_restart_seconds"] = (
+            restart_after if restart_after >= 0 else DEFAULT_SENSOR_LOSS_RESTART_SECONDS
+        )
         return loaded
     except Exception:
         # If config is corrupted or missing section, return defaults
@@ -266,6 +409,20 @@ def set_tier_values(**kwargs) -> None:
             if key in TIER_VALUES:
                 TIER_VALUES[key] = float(value)
 
+def get_advisory_values() -> dict:
+    """Thread-safe snapshot of the advisory settings, including the on/off flag."""
+    with _config_lock:
+        return dict(ADVISORY_VALUES)
+
+def set_advisory_values(**kwargs) -> None:
+    """Thread-safe setter for advisory values. Unknown keys are ignored."""
+    with _config_lock:
+        for key, value in kwargs.items():
+            if key not in ADVISORY_VALUES:
+                continue
+            ADVISORY_VALUES[key] = (bool(value) if key == "advisories_enabled"
+                                    else float(value))
+
 def get_response_mode() -> str:
     """Thread-safe getter. Changed from the tray at runtime, read every tick."""
     with _config_lock:
@@ -294,8 +451,12 @@ def reset_config_to_defaults() -> bool:
 _config_data = load_config()
 set_config_values(_config_data["threshold_amps"], _config_data["sustained_seconds_required"])
 set_tier_values(**_config_data)
+set_advisory_values(**_config_data)
 set_response_mode(_config_data.get("response_mode", DEFAULT_RESPONSE_MODE))
 SENSOR_BACKEND = _config_data.get("sensor_backend", DEFAULT_SENSOR_BACKEND)
+SENSOR_LOSS_RESTART_SEC = _config_data.get(
+    "sensor_loss_restart_seconds", DEFAULT_SENSOR_LOSS_RESTART_SECONDS
+)
 
 # =========================
 # Direct (HWiNFO-free) backend - optional import
@@ -841,6 +1002,276 @@ class FlightRecorder:
             pass
 
 
+class Advisory(NamedTuple):
+    """One thing the advisor wants said. The caller decides how to say it."""
+
+    # "dead_pin", "imbalance", "no_current" or "cleared".
+    kind: str
+    # 1-based pin the advisory is about (the quiet one, or the busiest one). None
+    # when the advisory is about all of them at once.
+    pin: Optional[int]
+    # Full line for a log file or Event Viewer: numbers and what to do about them.
+    message: str
+    # One short line, for a toast.
+    summary: str
+    # Tooltip fragment, a few words. Empty for "cleared".
+    short: str
+    # True for the first warning of an episode, False for a repeat. A "cleared"
+    # advisory is not a warning, so it is never first.
+    first: bool
+    # On a "cleared" advisory, the kind of episode that just ended, so the caller can
+    # undo exactly what it did for that kind. None on a warning.
+    ended: Optional[str] = None
+
+
+class PinAdvisor:
+    """Warn-only reading of the six pins. It never mitigates and never stops.
+
+    Two jobs, both of which the absolute per-pin tiers are blind to.
+
+    The shape of the readings. An open pin moves its load to the pins that are left,
+    and if the card is not near its limit no single pin has to go over threshold for
+    the connector to be in trouble. This looks at the spread rather than the biggest
+    reading. Those two kinds are advisories in the ordinary sense and the caller can
+    switch them off.
+
+    The sensor path itself. If every pin reads nothing, the guard is watching a wire
+    that carries no current (slot power on a BTF board, or a dead sensor block) and
+    nothing above this line means anything. That is not an opinion about the cable,
+    it is the guard admitting it cannot see the load, so it is not something the
+    advisories setting can silence.
+
+    Deliberately platform neutral: pure logic, no toast, no Event Viewer, no shared
+    state, no logger, no clock of its own (every decision uses the `now` handed in).
+    The caller renders whatever evaluate() returns, which is what lets the planned
+    Linux daemon import this class unchanged.
+    """
+
+    def __init__(self, values: Optional[dict] = None):
+        merged = dict(DEFAULT_ADVISORY_VALUES)
+        if values:
+            merged.update(values)
+        self.load_amps = float(merged["advisory_load_amps"])
+        self.dead_pin_max_amps = float(merged["dead_pin_max_amps"])
+        self.imbalance_spread_amps = float(merged["imbalance_spread_amps"])
+        self.sustain_seconds = float(merged["advisory_sustain_seconds"])
+        self.repeat_seconds = float(merged["advisory_repeat_seconds"])
+        self.reset()
+
+    def reset(self) -> None:
+        """Forget everything. Called whenever the caller's own timers reset.
+
+        A gap in the readings (sensor loss, suspend, a pause) means the half-formed
+        condition on the other side of it was never observed for as long as it looks.
+        """
+        # The condition seen on the last tick, and when its unbroken run started.
+        self._kind: Optional[str] = None
+        self._since: Optional[float] = None
+        # The episode already reported, if any, and when it was last reported.
+        self._episode: Optional[str] = None
+        self._episode_pin: Optional[int] = None
+        self._last_report = 0.0
+        # When the reported episode's condition went away, for the clear timer.
+        self._absent_since: Optional[float] = None
+
+    def evaluate(self, now: float, pins, board_power_w: Optional[float] = None,
+                 advisories_enabled: bool = True) -> List[Advisory]:
+        """One tick. Returns what should be said this time, usually nothing.
+
+        pins is the loop's [(label, amps, unit)] list.
+
+        board_power_w is what the card says it is drawing, when the caller can ask
+        (NVML in tiered mode on Windows). None leaves the power half of the
+        sensor-path check inert, and every other rule works exactly the same.
+
+        advisories_enabled is the user's `advisories` setting, passed per call rather
+        than read from the settings this class was built with, because it gates only
+        the two cable advisories. The sensor-path check runs either way: a guard that
+        cannot see the load has to say so whatever the user asked to be told about.
+        """
+        out: List[Advisory] = []
+        kind, rule, pin, message, summary, short = self._classify(
+            pins, board_power_w, advisories_enabled)
+
+        if kind is None:
+            self._kind = None
+            self._since = None
+            if self._episode is not None:
+                if self._absent_since is None:
+                    self._absent_since = now
+                elif (now - self._absent_since) >= ADVISORY_CLEAR_SEC:
+                    out.append(self._close_episode())
+            return out
+
+        # A different fault than the one being reported is a new episode. The old one
+        # is over whether or not it had the full clear window to end quietly.
+        if self._episode is not None and self._episode != kind:
+            out.append(self._close_episode())
+
+        if kind != self._kind:
+            self._kind = kind
+            self._since = now
+        self._absent_since = None
+
+        if self._episode is None:
+            if (now - self._since) >= self._sustain_for(rule):
+                self._episode = kind
+                self._episode_pin = pin
+                self._last_report = now
+                out.append(Advisory(kind, pin, message, summary, short, True))
+        elif self.repeat_seconds > 0 and (now - self._last_report) >= self.repeat_seconds:
+            self._episode_pin = pin
+            self._last_report = now
+            out.append(Advisory(kind, pin, message, summary, short, False))
+        return out
+
+    # ---- internals ----
+    def _sustain_for(self, rule: Optional[str]) -> float:
+        """How long this particular condition has to hold before it is worth saying.
+
+        The two cable advisories share the configured sustain. The sensor-path rules
+        have their own: no current at all is a slower, quieter claim and gets a full
+        minute, while a power reading that contradicts the pins is already specific
+        and only needs half of that. Read from the module at call time so the numbers
+        stay in one place.
+        """
+        return {
+            "no_current_zero": NO_CURRENT_SUSTAIN_SEC,
+            "no_current_power": MISMATCH_SUSTAIN_SEC,
+        }.get(rule, self.sustain_seconds)
+
+    def _close_episode(self) -> Advisory:
+        """End the reported episode and produce the one line that says so."""
+        ended = self._episode
+        pin = self._episode_pin
+        if ended == "no_current":
+            message = "Sensor path cleared: the pins carry current again."
+        else:
+            name = "dead pin" if ended == "dead_pin" else "imbalance"
+            where = f" on pin {pin}" if pin else ""
+            message = f"Pin advisory cleared: the {name} condition{where} is gone."
+        self._episode = None
+        self._episode_pin = None
+        self._last_report = 0.0
+        self._absent_since = None
+        return Advisory("cleared", pin, message, message, "", False, ended)
+
+    def _classify(self, pins, board_power_w: Optional[float] = None,
+                  advisories_enabled: bool = True):
+        """(kind, rule, pin, message, summary, short), kind None if clean.
+
+        `rule` names the exact condition inside the kind, because the two
+        sensor-path rules share one kind (and so one episode, one clear) while
+        waiting different lengths of time.
+        """
+        nothing = (None, None, None, "", "", "")
+        try:
+            amps = [float(a) for _label, a, _unit in pins]
+        except Exception:
+            return nothing
+        if len(amps) < 2:
+            return nothing
+
+        # The sensor path first, and deliberately above the load gate: the gate is
+        # computed from the very readings that are missing, so gating this rule would
+        # be asking a broken sensor for permission to report itself. Zeros are the
+        # whole signal here.
+        sensor_path = self._classify_sensor_path(amps, board_power_w)
+        if sensor_path is not None:
+            return sensor_path
+
+        # Everything below is an advisory about the cable, which the user can switch
+        # off. Nothing above is.
+        if not advisories_enabled:
+            return nothing
+
+        # Idle noise is not a fault. Nothing can start below the load gate, and an
+        # episode that is running is treated as absent, which feeds its clear timer.
+        if sum(amps) < self.load_amps:
+            return nothing
+
+        # Dead pin first: it is the more specific fault, and a dead pin usually
+        # produces a large spread as well.
+        dead = [i for i, a in enumerate(amps) if a <= self.dead_pin_max_amps]
+        if dead:
+            low = min(dead, key=lambda i: amps[i])
+            others = [a for j, a in enumerate(amps) if j != low]
+            mean_others = sum(others) / len(others)
+            if mean_others >= DEAD_PIN_OTHERS_MIN_AMPS:
+                pin = low + 1
+                extra = f" ({len(dead)} pins read near zero)" if len(dead) > 1 else ""
+                summary = (f"Pin {pin} reads {amps[low]:.2f} A while the others average "
+                           f"{mean_others:.2f} A{extra}.")
+                message = (f"Pin advisory: pin {pin} reads {amps[low]:.2f} A while the "
+                           f"other {len(others)} average {mean_others:.2f} A{extra}. That "
+                           f"pin or its contact looks open, so the load is going through "
+                           f"the rest. Reseat the cable at both ends and check the "
+                           f"connector.")
+                return ("dead_pin", "dead_pin", pin, message, summary,
+                        f"pin {pin} near zero")
+
+        hi = max(range(len(amps)), key=lambda i: amps[i])
+        lo = min(range(len(amps)), key=lambda i: amps[i])
+        spread = amps[hi] - amps[lo]
+        if spread >= self.imbalance_spread_amps and amps[hi] >= IMBALANCE_MIN_MAX_AMPS:
+            pin = hi + 1
+            summary = (f"Pin {pin} carries {amps[hi]:.2f} A, pin {lo + 1} carries "
+                       f"{amps[lo]:.2f} A (spread {spread:.2f} A).")
+            message = (f"Pin advisory: pin {pin} carries {amps[hi]:.2f} A while pin "
+                       f"{lo + 1} carries {amps[lo]:.2f} A, a spread of {spread:.2f} A "
+                       f"across the connector. Uneven contact resistance puts the heat "
+                       f"on the busiest pin. Reseat the cable at both ends and check the "
+                       f"connector.")
+            return ("imbalance", "imbalance", pin, message, summary,
+                    f"pin {pin} high, spread {spread:.1f}A")
+
+        return nothing
+
+    def _classify_sensor_path(self, amps, board_power_w: Optional[float]):
+        """The sensor-path condition for this sample, or None when the pins look real.
+
+        Two ways to reach the same conclusion, so they share the "no_current" kind and
+        with it one episode and one cleared line. When both are true the power wording
+        wins, because naming the two numbers is a stronger thing to show someone than
+        saying the pins read nothing.
+        """
+        total = sum(amps)
+
+        # The power half. Inert without a reading, and only above a load where the
+        # slot alone cannot be the explanation.
+        if board_power_w is not None and board_power_w >= MISMATCH_MIN_WATTS:
+            expected = board_power_w / 12.0
+            if total < (MISMATCH_RATIO * expected):
+                message = (f"Sensor path: the card draws {board_power_w:.0f} W but the "
+                           f"pins add up to {total:.1f} A (expected about "
+                           f"{expected:.0f} A). The pin sensors are not on the load "
+                           f"path, so this tool cannot protect the card. On a BTF "
+                           f"motherboard with slot (GC-HPWR) power this is expected: "
+                           f"the load bypasses the card-side sensors. See the BTF note "
+                           f"in the README.")
+                summary = (f"The card draws {board_power_w:.0f} W but the pins add up to "
+                           f"{total:.1f} A. This tool cannot protect the card in this "
+                           f"setup.")
+                short = f"pins carry {total:.1f}A of about {expected:.0f}A, not protected"
+                return "no_current", "no_current_power", None, message, summary, short
+
+        # The core half, which needs nothing but the pins and so runs in every
+        # response mode, on every platform.
+        if all(a <= NO_CURRENT_AMPS for a in amps):
+            message = (f"Sensor path: all {len(amps)} pins read {NO_CURRENT_AMPS:.2f} A "
+                       f"or less for {NO_CURRENT_SUSTAIN_SEC:.0f} s. The pin sensors see "
+                       f"no current, so this tool cannot protect the card. On a BTF "
+                       f"motherboard with slot (GC-HPWR) power this is expected: the "
+                       f"load bypasses the card-side sensors. See the BTF note in the "
+                       f"README.")
+            summary = ("The pin sensors see no current. This tool cannot protect the "
+                       "card in this setup.")
+            return ("no_current", "no_current_zero", None, message, summary,
+                    "no current on any pin, not protected")
+
+        return None
+
+
 def candidate_backends(logger: logging.Logger) -> List[object]:
     """Backend classes to try, in order, for the configured sensor_backend setting."""
     if SENSOR_BACKEND == "hwinfo":
@@ -1182,11 +1613,16 @@ class TieredResponse:
                     f"persistent fault and shut the machine down.")
         if not restored:
             msg += " WARNING: the card may not be fully restored, check the log above."
+            if HAVE_EVENTLOG:
+                # The read-back detail (both numbers) when the mitigator has it.
+                eventlog_write(win32con.EVENTLOG_WARNING_TYPE, 6007,
+                               getattr(m, "last_restore_warning", None) or msg)
 
         self.log.warning(msg)
         if HAVE_EVENTLOG:
             eventlog_write(win32con.EVENTLOG_INFORMATION_TYPE, 6005, msg)
-        toast("12VHPWR Guard", "GPU restored to normal clocks and power limit.")
+        toast("12VHPWR Guard", "GPU restored to normal clocks and power limit." if restored
+              else "GPU limit released, but the restore could not be verified. Check the log.")
 
     def reset_timers(self) -> None:
         """Drop every in-flight timer. Used after a suspend/resume gap."""
@@ -1350,6 +1786,17 @@ shared = {
     "source": "",
     # "" until we know, then "ready" or the reason the GPU cannot be limited.
     "mitigation": "",
+    # A few words about a live pin advisory, None when there is nothing to say.
+    # Advisories never change the icon: the guard has not acted on anything.
+    "advisory": None,
+    # True while the pins report no current at all. This one does change the icon:
+    # purple already means "cannot protect", and a guard that cannot see the load has
+    # no business showing green. Cleared when the pins carry current again.
+    "sensor_path_fault": False,
+    # What the process should exit with. 0 is a clean stop (the user chose Exit, or
+    # the machine is shutting down) and Task Scheduler leaves it alone; 1 asks the
+    # scheduler for a restart. Set through request_exit() only.
+    "exit_code": 0,
 }
 
 def set_state(**kwargs):
@@ -1359,6 +1806,49 @@ def set_state(**kwargs):
 def get_state():
     with state_lock:
         return dict(shared)
+
+# =========================
+# Ending the process
+# =========================
+# The tray icon, published by run_tray() so a background thread that has to end the
+# process can unblock icon.run() in the main thread. None before the tray starts and
+# under tests, so every use has to tolerate that.
+TRAY_ICON = None
+
+def request_exit(code: int, stop_event: Optional[threading.Event] = None) -> None:
+    """Ask the process to end with this code, from any thread.
+
+    The monitor runs in a daemon thread and cannot call sys.exit() itself: that would
+    end the thread and leave the tray running with nothing behind it. So the code goes
+    into shared state, the loop is told to stop, and the tray icon is stopped, which
+    returns main() from icon.run() and lets it exit with the code. A non-zero code is
+    the whole point of the self-restart: the supervisor restarts the guard on any exit
+    that is not 0.
+    """
+    set_state(exit_code=int(code))
+    if stop_event is not None:
+        stop_event.set()
+    icon = TRAY_ICON
+    if icon is not None:
+        try:
+            icon.stop()
+        except Exception:
+            pass
+
+def pending_exit_code() -> int:
+    """The code main() should exit with. 0 unless something asked for another one."""
+    try:
+        return int(get_state().get("exit_code", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+def _span_text(seconds: float) -> str:
+    """A window in seconds as something a toast can say out loud."""
+    if seconds >= 120:
+        return f"{seconds / 60:.0f} minutes"
+    if seconds >= 60:
+        return "1 minute"
+    return f"{seconds:g} seconds"
 
 # =========================
 # Monitor thread
@@ -1405,6 +1895,31 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
         f"Tier 2 critical={tier_values['critical_amps']:.2f}A/{tier_values['critical_seconds']:.0f}s | "
         f"Tier 3 catastrophic={tier_values['catastrophic_amps']:.2f}A"
     )
+    advisory_values = get_advisory_values()
+    if advisory_values["advisories_enabled"]:
+        logger.info(
+            f"Advisories (warn only): load gate={advisory_values['advisory_load_amps']:.1f}A | "
+            f"dead pin<={advisory_values['dead_pin_max_amps']:.2f}A | "
+            f"spread>={advisory_values['imbalance_spread_amps']:.2f}A | "
+            f"sustain={advisory_values['advisory_sustain_seconds']:.0f}s | "
+            f"repeat={advisory_values['advisory_repeat_seconds']:.0f}s"
+        )
+    else:
+        logger.info("Advisories: off")
+    # Says which half of the sensor-path check is running. The pin half runs in both
+    # modes and is never silenced by `advisories = off`; only the board power reading
+    # needs NVML, which shutdown-only mode does not touch.
+    if get_response_mode() == RESPONSE_TIERED:
+        logger.info("Sensor-path check: pins and board power")
+    else:
+        logger.info("Sensor-path check: pins only (no NVML in shutdown-only mode)")
+    # Read once here like the tier and advisory numbers, so a value the file changes
+    # mid-run cannot move the deadline a live outage is already being measured against.
+    restart_after = SENSOR_LOSS_RESTART_SEC
+    logger.info(
+        "Self-restart after direct sensor loss: "
+        + (f"{restart_after:g} s" if restart_after > 0 else "off")
+    )
     toast("12VHPWR Guard", "Monitoring started.")
     if HAVE_EVENTLOG:
         eventlog_write(win32con.EVENTLOG_INFORMATION_TYPE, 1000, "12VHPWR Guard started.")
@@ -1431,8 +1946,15 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
 
     # active data source
     backend = None
+    # Self-restart bookkeeping. direct_seen stays True for the rest of the process
+    # once the card's own sensor has been read: it is what separates "the driver took
+    # our session away" from "this machine never had a direct sensor to lose".
+    # source_lost_at is the moment the guard went blind, None whenever it is not.
+    direct_seen = False
+    source_lost_at: Optional[float] = None
     crosscheck = CrossCheck()
     flight = FlightRecorder()
+    advisor = PinAdvisor(advisory_values)
     backend_classes = candidate_backends(logger)
 
     # pause bookkeeping: a paused guard protects nothing, so it must not be
@@ -1472,6 +1994,77 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
         f"Sensor backend: setting={SENSOR_BACKEND}, "
         f"trying [{', '.join(c.key for c in backend_classes)}]"
     )
+
+    def render_advisory(adv: Advisory) -> None:
+        """Say one advisory out loud. Nothing here touches the GPU or the machine.
+
+        PinAdvisor stays platform neutral, so every Windows-specific part of an
+        advisory (toast, Event Viewer, tray tooltip, icon colour) happens here instead.
+        """
+        if adv.kind == "cleared":
+            logger.info(adv.message)
+            if HAVE_EVENTLOG:
+                eventlog_write(win32con.EVENTLOG_INFORMATION_TYPE, 7004, adv.message)
+            if adv.ended == "no_current":
+                # The pins carry current again, so the readings mean something again
+                # and the icon is allowed back to green on the next tick.
+                set_state(advisory=None, sensor_path_fault=False)
+            else:
+                set_state(advisory=None)
+            return
+
+        logger.warning(adv.message)
+        if HAVE_EVENTLOG:
+            eventlog_write(win32con.EVENTLOG_WARNING_TYPE,
+                           ADVISORY_EVENT_IDS.get(adv.kind, 7001), adv.message)
+        if adv.kind == "no_current":
+            # Not a warning about the cable but about this tool: it is watching a wire
+            # that carries nothing. The flag holds the icon purple until it is cleared.
+            set_state(advisory=adv.short, sensor_path_fault=True)
+            toast("12VHPWR Guard - not protected", adv.summary)
+        else:
+            set_state(advisory=adv.short)
+            toast("12VHPWR Guard - advisory", adv.summary)
+        if adv.first:
+            # The minute before the first warning is the evidence: it is what an RMA
+            # claim or a bug report needs, and the fault may not repeat on demand.
+            flight.dump(logger, "advisory")
+
+    def set_ok_status(message: str) -> None:
+        """Report a healthy tick, unless the guard cannot see the load at all.
+
+        OVER, MITIGATED and SHUTDOWN are set elsewhere and still win: those come from
+        readings that are plainly real, and they are acted on whatever the sensor path
+        looks like. This is only about the guard's right to say OK.
+        """
+        if get_state().get("sensor_path_fault"):
+            set_state(status=Status.ERROR,
+                      last_message="Not protected: the pin sensors see no current")
+        else:
+            set_state(status=Status.OK, last_message=message)
+
+    def board_power_watts() -> Optional[float]:
+        """What the card says it is drawing, or None when we cannot ask.
+
+        Shutdown-only mode reads nothing here, and the mode is checked rather than
+        left to ensure_mitigator() returning None, so the promise holds even for a
+        session that was switched out of tiered mode with a handle already bound.
+        In tiered mode this asks the mitigator the loop already has, which the
+        response ladder has bound on the first tick anyway, so nothing new is loaded.
+        Best effort by construction: the mitigator is injectable, and losing a
+        monitoring tick over an enrichment reading would be a worse bug than not
+        having the number.
+        """
+        if get_response_mode() != RESPONSE_TIERED:
+            return None
+        m = ensure_mitigator()
+        if m is None or not m.is_available:
+            return None
+        try:
+            milliwatts = m.power_usage_mw()
+        except Exception:
+            return None
+        return None if milliwatts is None else float(milliwatts) / 1000.0
 
     def try_connect() -> bool:
         """One pass over the candidate backends. True as soon as one connects."""
@@ -1555,6 +2148,39 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
 
         return False
 
+    def maybe_restart_for_sensor_loss() -> bool:
+        """End the process when the direct sensor path has been gone too long.
+
+        A driver update kills the NVAPI session the direct backend holds and nothing
+        in this process ever gets it back (PR #1: 131 failed reconnects in a row, and
+        a blind guard until the task was restarted by hand). A new process gets a new
+        driver session, so past the window this exits with RESTART_EXIT_CODE and the
+        supervisor process starts the guard again.
+
+        Only for a session where the direct backend actually connected at some point.
+        An unsupported card, or a `sensor_backend = hwinfo` install, keeps waiting
+        purple exactly as before, so closing HWiNFO can never turn into a restart
+        loop. A session that ran on the direct sensor, fell back to HWiNFO and then
+        lost that too does restart: it has no source at all, and the direct path is
+        the one a fresh process can fix.
+
+        At most one restart per outage by construction, because the process ends.
+        """
+        if restart_after <= 0 or not direct_seen or source_lost_at is None:
+            return False
+        if (time.time() - source_lost_at) < restart_after:
+            return False
+
+        msg = (f"Restarting to recover the sensor path: no pin-current source for "
+               f"{restart_after:g} s after the direct sensor was lost")
+        logger.error(msg)
+        if HAVE_EVENTLOG:
+            eventlog_write(win32con.EVENTLOG_ERROR_TYPE, 9002, msg)
+        toast("12VHPWR Guard - restarting",
+              f"No sensor for {_span_text(restart_after)}, restarting to recover it.")
+        request_exit(RESTART_EXIT_CODE, stop_event)
+        return True
+
     try:
         while not stop_event.is_set():
             st = get_state()
@@ -1565,6 +2191,10 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
                 if paused_since is None:
                     paused_since = now_paused
                     last_pause_reminder = now_paused
+                    # Nothing is being watched from here on, so a half-formed
+                    # advisory must not survive the pause either.
+                    advisor.reset()
+                    set_state(advisory=None, sensor_path_fault=False)
                 if response.engaged:
                     # Pausing hands the decision back to the user. Leaving their GPU
                     # crippled while no longer watching it is not ours to do.
@@ -1585,11 +2215,20 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
                 minutes = int((time.time() - paused_since) / 60)
                 logger.info(f"Monitoring resumed after {minutes} min paused.")
                 paused_since = None
+                # Time spent paused is not time spent trying to reconnect, so it must
+                # not count towards the self-restart. Starting the clock over is the
+                # simple version of that, and it errs towards waiting longer.
+                if source_lost_at is not None:
+                    source_lost_at = time.time()
 
             # (Re)connect whenever we have no live data source.
             if backend is None:
                 if not try_connect():
-                    stop_event.wait(3)
+                    # Nothing in this process is going to fix a driver session that
+                    # died, so after long enough a fresh one is the only answer.
+                    if maybe_restart_for_sensor_loss():
+                        break
+                    stop_event.wait(RECONNECT_RETRY_SEC)
                     continue
 
                 # A new connection starts its timers from scratch.
@@ -1599,6 +2238,15 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
                 last_over_notice = 0.0
                 pins_missing = False
                 last_sample_time = None
+                # Protected again, whichever backend answered: an HWiNFO fallback is
+                # a source, so it stops the restart clock the same way.
+                source_lost_at = None
+                if getattr(backend, "key", "") == AstralBackend.key:
+                    direct_seen = True
+                # The advisor and the state it drives are always cleared together, so
+                # a purple hold can never outlive the episode that asked for it.
+                advisor.reset()
+                set_state(advisory=None, sensor_path_fault=False)
 
             try:
                 pins = backend.read_pins()
@@ -1616,6 +2264,12 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
                     clear_start = None
                     consecutive_over = 0
                     last_over_notice = 0.0
+                    advisor.reset()
+                    set_state(advisory=None, sensor_path_fault=False)
+                    # Belt and braces: a successful read means a successful connect
+                    # cleared this already, but nothing measured across a suspend is
+                    # allowed to survive it.
+                    source_lost_at = None
                     # Readings right after a resume are not trustworthy, so anything
                     # decided on the strength of them is dropped too.
                     if response.engaged:
@@ -1646,6 +2300,18 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
 
                 crosscheck.maybe_log(logger, backend, pins)
                 flight.record(pins)
+
+                # Warn only, and completely separate from the threshold logic below:
+                # nothing the advisor says ever engages the mitigator or shuts down.
+                # The advisor runs on every tick whatever `advisories` is set to: the
+                # flag goes in as an argument and silences the two cable advisories
+                # only, never the sensor-path check.
+                for adv in advisor.evaluate(
+                    sample_now, pins,
+                    board_power_w=board_power_watts(),
+                    advisories_enabled=get_advisory_values()["advisories_enabled"],
+                ):
+                    render_advisory(adv)
 
                 max_label, max_val, max_unit = max(pins, key=lambda x: x[1])
                 set_state(max_label=max_label, max_val=max_val, max_unit=max_unit)
@@ -1704,7 +2370,7 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
                             )
 
                 elif cleared:
-                    set_state(status=Status.OK, last_message=f"OK (max {max_val:.2f}{max_unit})")
+                    set_ok_status(f"OK (max {max_val:.2f}{max_unit})")
                     consecutive_over = 0
 
                     if clear_start is None:
@@ -1723,7 +2389,7 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
                         last_over_notice = 0.0
 
                 else:
-                    set_state(status=Status.OK, last_message=f"OK (near threshold: {max_val:.2f}{max_unit})")
+                    set_ok_status(f"OK (near threshold: {max_val:.2f}{max_unit})")
                     consecutive_over = 0
                     clear_start = None
 
@@ -1779,6 +2445,10 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
                 toast("12VHPWR Guard", "Sensor source lost. Waiting to reconnect...")
                 if over_start is not None:
                     logger.warning("Sustained over-threshold timer reset by sensor disconnect.")
+                # The advisory timers go with it: a condition seen before a blind
+                # spell was not observed across it.
+                advisor.reset()
+                set_state(advisory=None, sensor_path_fault=False)
                 if response.engaged:
                     # Deliberately stays engaged. We limited the card because the
                     # current was dangerous, and losing the ability to measure is not
@@ -1800,6 +2470,10 @@ def monitor_loop(stop_event: threading.Event, logger: logging.Logger):
                 backend = None
                 last_sample_time = None
                 set_state(source="")
+
+                # The guard is blind as of now. If it is still blind this long from
+                # here, and the direct sensor is what it lost, the process restarts.
+                source_lost_at = time.time()
 
                 # Re-arm the one-shot notifications for the next outage/recovery.
                 source_missing_notified = False
@@ -2056,6 +2730,23 @@ def confirm_unsafe_value(kind: str, new_value: float, default_value: float, unit
         f"Apply anyway?"
     )
 
+def log_setting_change(what: str, old, new) -> None:
+    """One line and one Event Viewer entry per setting the user actually changed.
+
+    Callers reach here only once the new value is live, so a cancelled dialog, a
+    declined warning and a value that did not move all leave no trace. Without
+    this the log's first sign of a lowered threshold is the trip it caused, which
+    reads like the guard fired on its own.
+
+    LOGGER is None before main() publishes it (and under tests); a tray click must
+    not blow up on that, so the line is simply dropped.
+    """
+    msg = f"Setting changed by user: {what} {old} -> {new}"
+    if LOGGER is not None:
+        LOGGER.info(msg)
+    if HAVE_EVENTLOG:
+        eventlog_write(win32con.EVENTLOG_INFORMATION_TYPE, 1010, msg)
+
 def change_threshold_amps(_icon, _item):
     """Open dialog to change threshold amps setting."""
     if dialog is None:
@@ -2072,6 +2763,12 @@ def change_threshold_amps(_icon, _item):
     if not confirm_unsafe_value("threshold", new_value, DEFAULT_THRESHOLD_AMPS, "A"):
         return
     set_config_values(new_value, sustained)
+    # Logged on the applied value, not the saved one: a config.ini write that fails
+    # still leaves this session monitoring at the new threshold.
+    if new_value != current_threshold:
+        log_setting_change(
+            "threshold", f"{current_threshold:.2f} A", f"{new_value:.2f} A"
+        )
     if save_config(new_value, sustained):
         toast("12VHPWR Guard", f"Threshold updated to {new_value:.2f} A")
     else:
@@ -2095,6 +2792,10 @@ def change_sustained_seconds(_icon, _item):
     ):
         return
     set_config_values(threshold, new_value)
+    if new_value != current_sustained:
+        log_setting_change(
+            "sustained seconds", f"{current_sustained:.1f} s", f"{new_value:.1f} s"
+        )
     if save_config(threshold, new_value):
         toast("12VHPWR Guard", f"Sustained seconds updated to {new_value:.1f} s")
     else:
@@ -2111,7 +2812,21 @@ def reset_to_defaults(_icon, _item):
     )
     if not ok:
         return
-    if reset_config_to_defaults():
+    old_threshold, old_sustained = get_config_values()
+    saved = reset_config_to_defaults()
+    # One line per value that moved, so a reset from defaults is silent rather than
+    # two lines saying nothing changed.
+    if old_threshold != DEFAULT_THRESHOLD_AMPS:
+        log_setting_change(
+            "threshold", f"{old_threshold:.2f} A", f"{DEFAULT_THRESHOLD_AMPS:.2f} A"
+        )
+    if old_sustained != DEFAULT_SUSTAINED_SECONDS_REQUIRED:
+        log_setting_change(
+            "sustained seconds",
+            f"{old_sustained:.1f} s",
+            f"{DEFAULT_SUSTAINED_SECONDS_REQUIRED:.1f} s",
+        )
+    if saved:
         toast("12VHPWR Guard", "Settings reset to defaults")
     else:
         toast("12VHPWR Guard", "Failed to reset settings")
@@ -2140,9 +2855,11 @@ def apply_response_mode(mode: str) -> None:
     two, and the tier timings apply either way. That is unlike raising a threshold,
     which does reduce protection and still asks.
     """
-    if get_response_mode() == mode:
+    current = get_response_mode()
+    if current == mode:
         return
     set_response_mode(mode)
+    log_setting_change("response mode", current, mode)
     saved = save_setting("response_mode", mode)
 
     if mode == RESPONSE_TIERED:
@@ -2174,7 +2891,15 @@ def open_log():
 
 def toggle_pause(_icon, _item):
     st = get_state()
-    set_state(paused=not st.get("paused", False))
+    was_paused = bool(st.get("paused", False))
+    set_state(paused=not was_paused)
+    # The loop logs how long a pause lasted once it resumes; this says who started
+    # and ended it, and when.
+    log_setting_change(
+        "monitoring",
+        "paused" if was_paused else "running",
+        "running" if was_paused else "paused",
+    )
 
 def toggle_autostart(_icon, _item):
     state = autostart_state(force=True)
@@ -2191,6 +2916,11 @@ def toggle_autostart(_icon, _item):
 
     target = not state
     if set_autostart(target):
+        # Only once the task itself reads back changed. A declined UAC prompt or a
+        # failed schtasks call leaves the setting alone, so there is nothing to log.
+        log_setting_change(
+            "autostart", "on" if state else "off", "on" if target else "off"
+        )
         toast(
             "12VHPWR Guard",
             f"Start with Windows {'enabled' if target else 'disabled'}.",
@@ -2221,23 +2951,34 @@ def tray_title() -> str:
     source = st.get("source", "")
     src = f" | {source}" if source else ""
 
+    # Warn-only, so it rides along with whatever the status already is rather than
+    # replacing it.
+    advisory = st.get("advisory") or ""
+    adv = f" | advisory: {advisory}" if advisory else ""
+
     if paused:
         return "12VHPWR Guard (Paused)"
     if status == Status.MITIGATED:
-        return f"12VHPWR Guard: LIMITED | {max_label} {max_val:.2f}{max_unit}{src}"
+        return f"12VHPWR Guard: LIMITED | {max_label} {max_val:.2f}{max_unit}{src}{adv}"
     if status in (Status.OVER, Status.SHUTDOWN):
-        return f"12VHPWR Guard: {status} | {max_label} {max_val:.2f}{max_unit}{src}"
+        return f"12VHPWR Guard: {status} | {max_label} {max_val:.2f}{max_unit}{src}{adv}"
     if status == Status.MISSING:
         return "12VHPWR Guard: Sensors missing"
     if status == Status.ERROR:
+        # Purple has always meant "cannot protect". There are two ways to get here
+        # now, so say which one: no readings at all, or readings that carry nothing.
+        if st.get("sensor_path_fault"):
+            detail = advisory or "the pin sensors see no current"
+            return f"12VHPWR Guard: NOT PROTECTED | {detail}{src}"
         return "12VHPWR Guard: Waiting for pin sensors"
 
     # Protection must never weaken silently: if a tier crossing is going straight to
     # shutdown, the tooltip says so even when the setting says otherwise.
     mode = " | shutdown-only" if effective_shutdown_only() else ""
-    return f"12VHPWR Guard: OK | Max {max_val:.2f}{max_unit}{src}{mode}"
+    return f"12VHPWR Guard: OK | Max {max_val:.2f}{max_unit}{src}{adv}{mode}"
 
 def run_tray(stop_event: threading.Event):
+    global TRAY_ICON
     if not HAVE_TRAY:
         raise RuntimeError("pystray/Pillow not installed. Install: pip install pystray pillow")
 
@@ -2306,14 +3047,21 @@ def run_tray(stop_event: threading.Event):
         except Exception:
             pass
 
+    # Published so the monitor thread can end the process through request_exit().
+    # The updater above is the backstop for the moment before this: it watches the
+    # stop event and stops the icon itself.
+    TRAY_ICON = icon
     threading.Thread(target=updater, daemon=True).start()
-    icon.run()
+    try:
+        icon.run()
+    finally:
+        TRAY_ICON = None
 
 # =========================
 # Main
 # =========================
 def main():
-    global dialog
+    global dialog, LOGGER
 
     # Two guards would mean two tray icons and two shutdown commands.
     if not acquire_single_instance():
@@ -2321,7 +3069,15 @@ def main():
         sys.exit(0)
 
     logger = setup_logger()
+    # Published before the tray starts, so the first setting the user changes is
+    # already logged. The monitor thread below gets the same instance.
+    LOGGER = logger
+    last_exit = os.environ.get(SUPERVISOR_LAST_EXIT_ENV)
+    if last_exit:
+        logger.warning(f"Restarted by the supervisor: the previous guard process exited "
+                       f"with code {last_exit}.")
     stop_event = threading.Event()
+    watch_supervisor(lambda: _stop_because_supervisor_gone(stop_event, logger))
 
     # Create dialog service (dedicated Tk thread) before starting tray
     dialog = DialogService()
@@ -2331,5 +3087,207 @@ def main():
 
     run_tray(stop_event)
 
+    # The tray is gone, but the monitor thread's cleanup is what puts the GPU limit back
+    # and logs the stop, and it is a daemon thread: returning straight away ended the
+    # process under it, so an Exit while limited left the card at its floor until the
+    # next start's recovery. Give it the time it needs, short of the supervisor-gone
+    # hard exit.
+    stop_event.set()
+    t.join(MONITOR_EXIT_JOIN_SEC)
+
+    # 0 for a stop the user asked for, which the supervisor leaves alone.
+    # RESTART_EXIT_CODE when the guard asked to be started again.
+    sys.exit(pending_exit_code())
+
+# =========================
+# Supervisor
+# =========================
+# Task Scheduler's "restart on failure" only covers a task that fails to launch. A
+# guard that started and then died (a crash, a kill, or the self-restart above) is
+# never started again by it: measured on the rig 2026-10-28, the guard stayed down
+# with LastTaskResult 0xFFFFFFFF and RestartCount 999 configured. So the process the
+# task starts is a supervisor: it runs the real guard as a child and starts it again
+# whenever it exits with anything but 0.
+#
+# It does nothing else (no sensor, no GPU, no tray, no log file), so there is next to
+# nothing in it that can fail. It stays in this file so the scheduled task, the
+# installer and every existing install keep working unchanged.
+SUPERVISOR_CHILD_FLAG = "--child"
+# Runs the guard in this process with no supervisor, for debugging.
+NO_SUPERVISOR_FLAG = "--no-supervisor"
+# Tells a restarted guard why it is running, so its log says so.
+SUPERVISOR_LAST_EXIT_ENV = "TWELVEVHPWR_GUARD_LAST_EXIT"
+# The supervisor's process id, so the guard can end when its supervisor does. Stopping
+# the scheduled task ends the supervisor, but the venv launcher lets grandchildren
+# break away from its job, so without this the guard outlived it (measured on the rig
+# 2026-10-28): an upgrade would have kept the old code running, an uninstall a guard.
+SUPERVISOR_PID_ENV = "TWELVEVHPWR_GUARD_SUPERVISOR_PID"
+# How long a guard whose supervisor is gone gets to stop cleanly before it is ended.
+SUPERVISOR_GONE_HARD_EXIT_SEC = 10.0
+# How long main() waits for the monitor thread's cleanup on exit. Under the hard exit
+# above, so a supervisor-gone stop still ends cleanly when the cleanup is healthy.
+MONITOR_EXIT_JOIN_SEC = 8.0
+# Seconds before restarting after an unplanned exit, one step further per crash in a
+# row, so a guard that dies at startup cannot spin the CPU. A child that ran for
+# SUPERVISOR_STABLE_SEC before dying starts the sequence over.
+SUPERVISOR_BACKOFF_SEC = (5.0, 10.0, 20.0, 40.0, 60.0)
+SUPERVISOR_STABLE_SEC = 120.0
+# A planned restart already waited out its own window inside the guard.
+SUPERVISOR_PLANNED_DELAY_SEC = 2.0
+
+
+def _supervisor_command() -> List[str]:
+    return [sys.executable, os.path.abspath(__file__), SUPERVISOR_CHILD_FLAG]
+
+
+def _spawn_guard(cmd: List[str], env: dict):
+    # No creation flags: under pythonw there is no console to hide, and under
+    # python.exe the child shares the console so a developer still sees its output.
+    return subprocess.Popen(cmd, cwd=BASE_DIR, env=env)
+
+
+def _announce_restart(code: Optional[int], delay: float) -> None:
+    """Event Viewer, plus a toast when the exit was not one the guard planned."""
+    planned = code == RESTART_EXIT_CODE
+    if code is None:
+        msg = f"Could not start the guard process; trying again in {delay:g} s."
+    elif planned:
+        msg = (f"The guard asked to be restarted (exit code {code}); starting it again "
+               f"in {delay:g} s.")
+    else:
+        msg = (f"The guard process stopped unexpectedly (exit code {code}); starting "
+               f"it again in {delay:g} s.")
+    if HAVE_EVENTLOG:
+        etype = win32con.EVENTLOG_INFORMATION_TYPE if planned else win32con.EVENTLOG_WARNING_TYPE
+        eventlog_write(etype, 9003, msg)
+    if not planned:
+        # The guard's own self-restart already toasted; a crash has nobody else to say it.
+        toast("12VHPWR Guard - restarting", msg)
+
+
+def _guard_shutdown_pending() -> bool:
+    return os.path.exists(LAST_SHUTDOWN_PATH)
+
+
+def supervise(spawn=_spawn_guard, sleep=time.sleep, clock=time.monotonic,
+              announce=_announce_restart, command=None,
+              shutdown_pending=_guard_shutdown_pending) -> int:
+    """Run the guard as a child until it exits with 0. Returns 0."""
+    cmd = command or _supervisor_command()
+    crashes_in_a_row = 0
+    last_exit: Optional[int] = None
+    while True:
+        env = dict(os.environ)
+        env[SUPERVISOR_PID_ENV] = str(os.getpid())
+        if last_exit is not None:
+            env[SUPERVISOR_LAST_EXIT_ENV] = str(last_exit)
+        started = clock()
+        try:
+            code = spawn(cmd, env).wait()
+        except KeyboardInterrupt:
+            # Ctrl-C in a console reaches the child too; nothing left to supervise.
+            return 0
+        except OSError:
+            code = None
+        if code == 0:
+            return 0
+        # The guard writes its shutdown note just before it shuts the machine down, and
+        # Windows then ends it with a non-zero code. A guard restarted in that gap would
+        # announce and delete the note mid-shutdown, and the next boot would never warn.
+        if shutdown_pending():
+            return 0
+
+        if code == RESTART_EXIT_CODE:
+            delay = SUPERVISOR_PLANNED_DELAY_SEC
+            crashes_in_a_row = 0
+        else:
+            if code is not None and clock() - started >= SUPERVISOR_STABLE_SEC:
+                crashes_in_a_row = 0
+            delay = SUPERVISOR_BACKOFF_SEC[min(crashes_in_a_row, len(SUPERVISOR_BACKOFF_SEC) - 1)]
+            crashes_in_a_row += 1
+        last_exit = code if code is not None else -1
+        try:
+            announce(code, delay)
+        except Exception:
+            pass
+        try:
+            sleep(delay)
+        except KeyboardInterrupt:
+            return 0
+
+
+def _open_process_for_wait(pid: int):
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = wt.HANDLE
+    k32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+    SYNCHRONIZE = 0x00100000
+    return k32.OpenProcess(SYNCHRONIZE, False, pid)
+
+
+def _wait_for_process(handle) -> None:
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.WaitForSingleObject.restype = wt.DWORD
+    k32.WaitForSingleObject.argtypes = [wt.HANDLE, wt.DWORD]
+    k32.CloseHandle.argtypes = [wt.HANDLE]
+    INFINITE = 0xFFFFFFFF
+    try:
+        k32.WaitForSingleObject(handle, INFINITE)
+    finally:
+        k32.CloseHandle(handle)
+
+
+def watch_supervisor(on_gone, pid_text: Optional[str] = None,
+                     open_process=_open_process_for_wait,
+                     wait=_wait_for_process) -> Optional[threading.Thread]:
+    """Call on_gone() once the supervisor that started this guard has ended.
+
+    Does nothing for a guard nobody supervises (--no-supervisor, or an older launcher).
+    The handle is opened straight away, while the supervisor is certainly alive: it is
+    blocked waiting on this very process, so the id cannot have been reused yet. A
+    supervisor that cannot be opened is treated as already gone.
+    """
+    if pid_text is None:
+        pid_text = os.environ.get(SUPERVISOR_PID_ENV)
+    if not pid_text:
+        return None
+    try:
+        pid = int(pid_text)
+    except ValueError:
+        return None
+    handle = open_process(pid)
+    if not handle:
+        on_gone()
+        return None
+
+    def run():
+        wait(handle)
+        on_gone()
+
+    t = threading.Thread(target=run, name="supervisor-watch", daemon=True)
+    t.start()
+    return t
+
+
+def _stop_because_supervisor_gone(stop_event: threading.Event, logger: logging.Logger) -> None:
+    logger.warning("The supervisor process ended (the scheduled task was stopped or the "
+                   "supervisor was ended), so the guard is stopping as well.")
+    request_exit(0, stop_event)
+
+    def hard_exit():
+        # Only reached when the clean stop above is stuck; a clean stop ends the
+        # process first and takes this daemon thread with it.
+        time.sleep(SUPERVISOR_GONE_HARD_EXIT_SEC)
+        os._exit(0)
+
+    threading.Thread(target=hard_exit, name="supervisor-gone-exit", daemon=True).start()
+
+
+def entry(argv: List[str]) -> int:
+    if SUPERVISOR_CHILD_FLAG in argv or NO_SUPERVISOR_FLAG in argv:
+        main()
+        return 0
+    return supervise()
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(entry(sys.argv[1:]))

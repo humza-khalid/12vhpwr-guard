@@ -181,6 +181,11 @@ class _Nvml:
                    [ctypes.c_void_p, c_uint_p, c_uint_p])
         self._bind("nvmlDeviceSetPowerManagementLimit", ctypes.c_int,
                    [ctypes.c_void_p, ctypes.c_uint32])
+        # Read-only, and optional: the guard uses it to tell a card that is drawing
+        # real power through a slot from one that is drawing nothing at all. A driver
+        # that does not export it must not cost the guard its mitigation.
+        self._bind("nvmlDeviceGetPowerUsage", ctypes.c_int,
+                   [ctypes.c_void_p, c_uint_p], required=False)
         self._bind("nvmlDeviceSetGpuLockedClocks", ctypes.c_int,
                    [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32])
         self._bind("nvmlDeviceResetGpuLockedClocks", ctypes.c_int, [ctypes.c_void_p])
@@ -230,6 +235,12 @@ class _Nvml:
         limit = ctypes.c_uint32(0)
         self._call("nvmlDeviceGetPowerManagementLimit", handle, ctypes.byref(limit))
         return int(limit.value)
+
+    def power_usage_mw(self, handle) -> int:
+        """What the board is drawing right now. Raises if the driver lacks the call."""
+        usage = ctypes.c_uint32(0)
+        self._call("nvmlDeviceGetPowerUsage", handle, ctypes.byref(usage))
+        return int(usage.value)
 
     def power_limit_constraints_mw(self, handle) -> Tuple[int, int]:
         lo = ctypes.c_uint32(0)
@@ -311,6 +322,9 @@ class GpuMitigator:
         self._applied_power = False
         self._applied_clocks = False
         self._locked_at = None
+        # True between a restore that failed verification and the next one that works.
+        # It is what keeps the marker file alive across an idempotent second release().
+        self._restore_unverified = False
 
         self.gpu_name = None
         self.subsystem_id = None
@@ -320,6 +334,10 @@ class GpuMitigator:
         self.engaged = False
         self.engaged_reason = None
         self.unavailable_reason = "not connected"
+        # Outcome of the last release() or startup_recovery(): None when the card was
+        # read back at the saved limit, otherwise the warning text. The guard reads it
+        # where it already handles a failed release, to raise an Event Viewer entry.
+        self.last_restore_warning: Optional[str] = None
 
     # -- logging ------------------------------------------------------------
     def _say(self, level: str, msg: str) -> None:
@@ -505,12 +523,63 @@ class GpuMitigator:
             self._say("warning", f"power limit change refused ({ex})")
             return False
 
+    def _verify_restored_power_limit(self, saved_mw: int) -> Optional[str]:
+        """Read the power limit back and prove it really is the saved value.
+
+        A successful set call only means the driver accepted the request. This asks the
+        card what it actually reports; on a mismatch it issues the set once more and
+        reads again, because the failure worth catching is a single request the driver
+        quietly dropped. A card that ignores two of them will not take a third.
+
+        Returns None when the card reports the saved value, otherwise the warning text
+        for the caller to log and expose.
+
+        The comparison is exact integers in milliwatts, on purpose. The saved value came
+        out of this same NVML call on this same card, so a different number coming back
+        means the restore did not happen, not that a unit got rounded.
+        """
+        saved = int(saved_mw)
+        actual = None
+        for attempt in (1, 2):
+            if attempt == 2:
+                # A driver that reports a new limit a few milliseconds late must not be
+                # mistaken for one that dropped the request and cost the user a kept marker.
+                time.sleep(0.1)
+            try:
+                actual = int(self._nvml.power_limit_mw(self._handle))
+            except Exception as ex:
+                return (f"Power limit restore verification failed: could not read the limit "
+                        f"back ({ex}), expected {saved} mW")
+            if actual == saved:
+                self._say("debug", f"power limit verified at {actual} mW"
+                                   f"{' after one retry' if attempt > 1 else ''}")
+                return None
+            if attempt == 1:
+                try:
+                    self._nvml.set_power_limit_mw(self._handle, saved)
+                except Exception as ex:
+                    return (f"Power limit restore verification failed: card reports {actual} mW, "
+                            f"expected {saved} mW (the retry was refused: {ex})")
+        return (f"Power limit restore verification failed: card reports {actual} mW, "
+                f"expected {saved} mW")
+
     def release(self) -> bool:
-        """Undo exactly what engage() changed. Idempotent and safe when not engaged."""
+        """Undo exactly what engage() changed, and prove the power limit went back.
+
+        Idempotent and safe when not engaged. Returns False if the restore could not be
+        verified, in which case the recovery marker is deliberately left in place.
+        """
         if not self.engaged:
+            # A restore that failed verification keeps its marker until something puts
+            # the limit back for real, so this idempotent path must not delete the
+            # evidence on its way out. close() calls release() a second time.
+            if self._restore_unverified:
+                return False
             self._clear_marker()
             return True
 
+        self.last_restore_warning = None
+        self._restore_unverified = False
         restored = True
 
         if self._applied_power:
@@ -520,6 +589,13 @@ class GpuMitigator:
                 except Exception as ex:
                     restored = False
                     self._say("error", f"could not restore power limit ({ex})")
+                else:
+                    warning = self._verify_restored_power_limit(int(self._saved_power_limit_mw))
+                    if warning is not None:
+                        restored = False
+                        self._restore_unverified = True
+                        self.last_restore_warning = warning
+                        self._say("warning", warning)
             else:
                 # Never invent a value. Leaving the floor in place is visible and
                 # fixable; guessing the user's limit is neither.
@@ -538,7 +614,12 @@ class GpuMitigator:
         self.engaged_reason = None
         self._applied_power = False
         self._applied_clocks = False
-        self._clear_marker()
+        # A limit that verifiably did not restore must not be forgotten. Keeping the
+        # marker is what makes the next start's recovery try again; a stale marker costs
+        # one NVML round trip at that start, while a cleared one costs the user a card
+        # left at its floor with nothing around to notice.
+        if not self._restore_unverified:
+            self._clear_marker()
 
         if restored:
             self._say("info", "released - clocks unlocked and power limit restored")
@@ -563,6 +644,8 @@ class GpuMitigator:
 
         saved = marker.get("saved_power_limit_mw")
         problems = []
+        self.last_restore_warning = None
+        self._restore_unverified = False
 
         try:
             self._nvml.reset_locked_clocks(self._handle)
@@ -575,11 +658,21 @@ class GpuMitigator:
                     self._nvml.set_power_limit_mw(self._handle, int(saved))
                 except Exception as ex:
                     problems.append(f"power limit restore failed ({ex})")
+                else:
+                    warning = self._verify_restored_power_limit(int(saved))
+                    if warning is not None:
+                        # Same rule as release(): a restore that did not verify keeps its
+                        # marker, so the next start tries again instead of forgetting.
+                        self._restore_unverified = True
+                        self.last_restore_warning = warning
+                        problems.append(f"{warning} (the marker is kept, so the next start "
+                                        f"will try again)")
             else:
                 problems.append("no saved power limit in the marker; the card may still "
                                 "be at its minimum limit (fix with nvidia-smi -pl)")
 
-        self._clear_marker()
+        if not self._restore_unverified:
+            self._clear_marker()
         self.engaged = False
         self._applied_power = False
         self._applied_clocks = False
@@ -628,7 +721,8 @@ class GpuMitigator:
             except Exception:
                 pass
 
-    # -- observation (used by the tools, never by the decision path) --------
+    # -- observation (the tools and the guard's sensor-path check; never a decision
+    #    about limiting the card or shutting the machine down) ---------------
     def graphics_clock_mhz(self) -> Optional[int]:
         if not self.is_available:
             return None
@@ -638,6 +732,18 @@ class GpuMitigator:
         if not self.is_available:
             return None
         return self._safe(lambda: self._nvml.power_limit_mw(self._handle), None)
+
+    def power_usage_mw(self) -> Optional[int]:
+        """Board power draw in milliwatts, or None. Never raises.
+
+        None covers all three ways of not knowing: no connection, a driver without
+        the call (the binding is optional), and a call that failed. The caller only
+        ever uses this to add numbers to a message, so a missing reading costs it a
+        detail and nothing else.
+        """
+        if not self.is_available:
+            return None
+        return self._safe(lambda: self._nvml.power_usage_mw(self._handle), None)
 
     def close(self) -> None:
         """Release mitigation, then drop NVML. Never leaves the card limited."""
