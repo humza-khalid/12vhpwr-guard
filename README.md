@@ -69,8 +69,9 @@ This tool adds a last-line, OS-level safety net by:
 ## Requirements
 
 ### Hardware Compatibility
-**This utility ONLY works with ASUS ROG Astral cards.** These carry an ITE IT8915FN monitoring
-chip that measures each 12VHPWR pin individually. Recognized models (by PCI subsystem ID):
+**This utility ONLY works with the ASUS-built cards listed below:** the ROG Astral family, plus
+one ASUS-built OEM card. These carry an ITE IT8915FN monitoring chip that measures each 12VHPWR
+pin individually. Recognized models (by PCI subsystem ID):
 
 | Subsystem ID | Model |
 |---|---|
@@ -85,7 +86,7 @@ chip that measures each 12VHPWR pin individually. Recognized models (by PCI subs
 | `1043:8A5A` | ROG Astral RTX 5090 BTF OC (see BTF note) |
 | `1043:8A3C` | ROG Astral RTX 5090 BTF OC, second id revision of the same card (see BTF note) |
 | `1043:89DF` | ROG Astral RTX 5080 (non-OC) |
-| `1043:89FF` | ROG Astral RTX 5090, newer id revision (owner report, awaiting confirmation) |
+| `1043:89FF` | RTX 5090 built by ASUS as an OEM card for Cooler Master (not an Astral, same IT8915FN sensor) |
 
 **BTF note:** the BTF card is supported when it draws power through the normal 16-pin cable
 in a standard motherboard, which is where its card-side sensors sit. Installed in an actual
