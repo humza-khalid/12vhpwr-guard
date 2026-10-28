@@ -1049,6 +1049,10 @@ class Daemon:
                     self._stop.wait(self.reconnect_retry)
                     continue
                 self._on_connected()
+                # Bind NVML before the first sample, not inside it as Windows does. At boot
+                # the driver's first init can take ~5 s on Linux, and inside a tick that
+                # read as a suspend/resume gap (seen on Mint, S5).
+                self._ensure_mitigator()
 
             try:
                 code = self._tick()

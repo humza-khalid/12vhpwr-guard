@@ -126,6 +126,8 @@ class FakeMitigator:
 
     def connect(self, subsystem_id=None):
         self.connected_with = subsystem_id
+        if self.env.on_mitigator_connect is not None:
+            self.env.on_mitigator_connect()
         if self.env.mitigation_available:
             self.is_available = True
             self.unavailable_reason = None
@@ -212,6 +214,7 @@ class Env:
         self.made = []
         self.mitigation_available = True
         self.on_engage = None
+        self.on_mitigator_connect = None
         self.events = []        # ("sleep", seconds) and ("run", argv), in order
         self.runner_hook = None
         self.desktop = []       # (title, body, critical, sessions returned)
@@ -728,6 +731,23 @@ def test_resume_gap_releases_without_arming_retrigger(env):
     assert released == ["GPU limit released (suspend/resume gap)."]
     assert env.daemon._response.released_at is None
     assert [e for e in env.events if e[0] == "run"] == []
+
+
+def test_slow_nvml_bind_at_boot_is_not_a_resume_gap(env):
+    # Mint S5: the driver's first init took 5 s at boot and the next tick logged a
+    # suspend/resume gap. The bind now happens before the first sample.
+    reads_at_bind = []
+
+    def slow_first_init():
+        reads_at_bind.append(env.rig.reads)
+        env.clock_offset += 6.0
+
+    env.on_mitigator_connect = slow_first_init
+    env.start()
+    env.wait_for(lambda: env.rig.reads >= 5, what="a few samples")
+    assert env.stop() == 0
+    assert reads_at_bind == [0]
+    assert not env.has_log("detected (suspend/resume?)")
 
 
 # ======================================================================== F3 self-restart

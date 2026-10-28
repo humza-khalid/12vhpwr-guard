@@ -138,6 +138,10 @@ def test_every_hardening_line_is_commented():
 
 # ------------------------------------------------------------------ the scripts
 bash = shutil.which("bash")
+# On Windows, System32\bash.exe is the WSL launcher: it cannot open a C:\ path, so the
+# check would fail on the path, not the script. Git Bash (or Linux CI) runs it instead.
+if bash and os.path.normcase(os.path.dirname(bash)).endswith(os.path.normcase(r"\system32")):
+    bash = None
 
 
 @pytest.mark.skipif(bash is None, reason="bash not on PATH")
