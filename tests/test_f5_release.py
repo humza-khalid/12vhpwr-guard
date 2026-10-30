@@ -9,6 +9,8 @@ accepts a set and drops it, the card refuses to leave its floor, and the read it
 fails. Each is flipped after engage(), because that is when a real one would start.
 """
 
+import json
+
 import pytest
 
 from gpu_mitigation import MARKER_NAME, GpuMitigator, NvmlError
@@ -253,6 +255,68 @@ def test_startup_recovery_restores_and_clears_the_marker(tmp_path, fake, marker)
     assert fake.limit_mw == USER_LIMIT_MW
     assert fresh.last_restore_warning is None
     assert not marker.exists()
+
+
+def test_a_kill_in_the_middle_of_engage_is_still_recovered(tmp_path, fake, marker):
+    """Mint S5: a kill landed right at an engage. The marker must already be down when the
+    first limit reaches the card, or nothing would ever undo it."""
+    class Killed(BaseException):
+        pass
+
+    real_set_power = fake.set_power_limit_mw
+
+    def die_after_the_limit(handle, milliwatts):
+        real_set_power(handle, milliwatts)
+        raise Killed()
+
+    m = make_mitigator(tmp_path, fake)
+    assert m.connect(SUB_ID) is True
+    fake.set_power_limit_mw = die_after_the_limit
+    with pytest.raises(Killed):
+        m.engage("test")
+    fake.set_power_limit_mw = real_set_power
+    assert fake.limit_mw == MIN_MW and fake.locked_clocks is not None
+    assert marker.exists()
+
+    fresh = make_mitigator(tmp_path, fake)
+    msg = fresh.startup_recovery()
+
+    assert msg is not None and "restored" in msg, msg
+    assert fake.limit_mw == USER_LIMIT_MW
+    assert fake.locked_clocks is None
+    assert not marker.exists()
+
+
+def test_engage_that_applies_nothing_leaves_no_marker(tmp_path, fake, marker):
+    def refused(*args):
+        raise NvmlError("refused", 3)
+
+    m = make_mitigator(tmp_path, fake)
+    assert m.connect(SUB_ID) is True
+    fake.set_locked_clocks = refused
+    fake.set_power_limit_mw = refused
+
+    assert m.engage("test") is False
+    assert not marker.exists()
+    assert m.engaged is False
+
+
+def test_engage_keeps_a_marker_kept_by_an_unverified_restore(tmp_path, fake, marker):
+    """That marker holds the user's real limit, and a failed engage must not lose it."""
+    m = engage_one(tmp_path, fake)
+    fake.stuck_at = MIN_MW
+    assert m.release() is False
+    saved_text = marker.read_text(encoding="utf-8")
+    assert USER_LIMIT_MW == json.loads(saved_text)["saved_power_limit_mw"]
+
+    def refused(*args):
+        raise NvmlError("refused", 3)
+
+    fake.set_locked_clocks = refused
+    fake.set_power_limit_mw = refused
+
+    assert m.engage("test") is False
+    assert marker.read_text(encoding="utf-8") == saved_text
 
 
 def test_startup_recovery_reports_both_numbers_and_keeps_the_marker(tmp_path, fake, marker):

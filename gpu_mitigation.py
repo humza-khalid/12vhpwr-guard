@@ -533,20 +533,34 @@ class GpuMitigator:
             self._saved_power_limit_mw = None
             self._say("warning", f"could not read current power limit ({ex})")
 
+        # The marker goes down before the card changes, so a kill between the two cannot
+        # leave a limit nothing knows about. It claims both changes until the real result
+        # is in; recovery undoing one that never landed is harmless. No fsync: a killed
+        # process keeps its page cache, and a power loss clears the limit anyway. A marker
+        # kept by an unverified restore already covers this and holds the better saved value.
+        keep_existing_marker = self._restore_unverified
+        self.engaged_reason = reason
+        if not keep_existing_marker:
+            self._applied_clocks = True
+            self._applied_power = True
+            self._write_marker(sync=False)
+
         # Clocks first: that is the change that actually moves current, and every
         # millisecond counts once a pin is over threshold.
         applied_clocks = self._lock_clocks()
         applied_power = self._drop_power_limit()
 
+        self._applied_clocks = applied_clocks
+        self._applied_power = applied_power
         if not applied_clocks and not applied_power:
+            self.engaged_reason = None
+            if not keep_existing_marker:
+                self._clear_marker()
             self._say("error", "engage failed, nothing applied - shutdown remains the "
                                "only protection")
             return False
 
-        self._applied_clocks = applied_clocks
-        self._applied_power = applied_power
         self.engaged = True
-        self.engaged_reason = reason
         self._write_marker()
 
         self._say("warning",
@@ -783,7 +797,7 @@ class GpuMitigator:
         return (f"Previous run ended while the GPU was limited ({marker.get('reason', 'unknown')}) "
                 f"- {detail}")
 
-    def _write_marker(self) -> None:
+    def _write_marker(self, sync: bool = True) -> None:
         payload = {
             "engaged_at": time.time(),
             "pid": os.getpid(),
@@ -798,7 +812,8 @@ class GpuMitigator:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(payload, f)
                 f.flush()
-                os.fsync(f.fileno())
+                if sync:
+                    os.fsync(f.fileno())
             os.replace(tmp, self._marker_path)
         except Exception as ex:
             # Not fatal: the marker only matters if we crash before releasing.
